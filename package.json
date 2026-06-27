@@ -9,6 +9,7 @@
     "tail": "wrangler tail",
     "dev:frontend": "vite",
     "build:frontend": "node scripts/build.js",
+    "build": "vite build",
     "preview": "vite preview"
   },
   "keywords": [
