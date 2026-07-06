@@ -1,8 +1,17 @@
 # [CF-Server-Monitor](https://github.com/huilang-me/CF-Server-Monitor)
 
-一个基于 Cloudflare Workers + D1 + Durable Objects 的多服务器监控探针系统，支持实时监控、历史数据查看、延迟追踪、地图展示等功能。兼容主流Linux系统，Alpine Linux，OpenWrt，Windows系统。**演示地址**：<https://tz.dashdeep.dpdns.org/>
+一个基于 Cloudflare Workers + D1 + Durable Objects 的多服务器监控探针系统，支持实时监控、历史数据查看、延迟追踪、地图展示等功能。兼容主流Linux系统，Alpine Linux，OpenWrt，Windows系统。**演示地址**：<https://demo.huilang.me/>
 
-**当前版本：V2.7.5**
+**当前版本：V2.7.8**
+
+> [!IMPORTANT]
+> **🚨 紧急安全/性能更新 (v2.7.8)**
+> 
+> 本次版本修复了 **月度任务导致数据表索引丢失** 的严重 Bug。该问题影响 **v2.7.0 ~ v2.7.7** 所有版本。
+> 
+> ⚠️ **潜在影响**：此 Bug 会严重增加 D1 读行消耗，**可能导致免费额度超限，造成服务不可用**。
+> 
+> **👉 请所有用户务必立即升级！**
 
 <2.7.1 新增了功能，需要**升级安装脚本** 才能生效，否则无法获取丢包率
 ```
@@ -27,6 +36,9 @@ cat /etc/config/cf-probe/config.conf
 <details>
 <summary>更新记录</summary>
 
+- V2.7.8 修复月度任务导致数据表索引丢失的严重 Bug
+- V2.7.7 添加GitHub Page部署支持，添加飞书，Bark通知支持
+- V2.7.6 添加多站点支持包括验证码登录等，添加Windows PowerShell无依赖安装脚本，一些安全优化
 - V2.7.5 DO WebSocket改成 DO WebSocket Hibernation基本剔除DO Duration消耗，新增批量推送入口，每5秒批量接收多个服务器更新，减少 DO 请求次数。
 - V2.7.4 添加允许跨域配置，为后续版本额外功能做铺垫，前端加上跨域配置，修改成HASH模式，修改country为region，数据库自动维护
 - V2.7.3.3 压缩定时任务4个为2个，避免超出免费额度
@@ -35,7 +47,6 @@ cat /etc/config/cf-probe/config.conf
 - V2.7.3 新增服务器到期提醒功能，调整后台设置页面布局
 - V2.7.2 新增支持多分区磁盘统计功能以及其他优化，增加[图文教程](https://huilang.me/cf-server-monitor-setup/)
 - V2.7.1 新增国内四线路丢包率监控与历史图表，新增GPU字段与图表展示（GPU暂未测试），后台新增 Cloudflare D1/Workers 每日额度查询功能；
-
 - V2.7.0 将每日数据清理改为每月1号执行的表轮换任务, 删除旧表将不再扣除D1消耗,前端图表支持查看最长7天的历史数据,优化脚本一键升级功能
 - V2.6.10 修复了方式一部署方式，同步后丢失API\_SECRET的问题
 - V2.6.9 修复地图显示问题，重构OpenWrt安装脚本，新增OpenRC服务支持
@@ -55,7 +66,7 @@ cat /etc/config/cf-probe/config.conf
 - 📊 **实时监控**：CPU、GPU、内存、磁盘、网络、进程数、连接数、负载均衡
 - 📈 **历史图表**：支持7天历史数据查看
 - 🌍 **全球地图**：可视化展示服务器分布
-- 🔔 **离线告警**：支持 Telegram 和企业微信通知
+- 🔔 **离线告警**：支持 Telegram、企业微信 / 飞书 / Bark 通知
 - 📱 **响应式**：支持桌面端和移动端
 - 🔄 **自动部署**：GitHub Actions 一键部署
 - 🗺️ **网络质量追踪**：国内电信/联通/移动/字节延迟与丢包率监测
@@ -238,44 +249,49 @@ https://你的项目名.你的子域.workers.dev/#admin
 Ubuntu / Debian / CentOS / RHEL / Fedora / Rocky / AlmaLinux 系统
 
 ```bash
-curl -sL https://你的项目.你的子域.workers.dev/install.sh | bash -s install -id=<SERVER_ID> -secret=<SECRET> -url=<WORKER_URL> [-interval=60] [-ping=http] [-ct=xxx] [-cu=xxx] [-cm=xxx] [-bd=xxx] [-reset_day=1] [-rx_correction=N] [-tx_correction=N]
+curl -sL https://你的项目.你的子域.workers.dev/install.sh | bash -s install -id=<SERVER_ID> -secret=<SECRET> -url=<WORKER_URL> [-collect_interval=0] [-interval=60] [-ping=http] [-ct=xxx] [-cu=xxx] [-cm=xxx] [-bd=xxx] [-reset_day=1] [-rx_correction=N] [-tx_correction=N]
 ```
 
 Alpine 系统
 
 ```bash
-curl -sL https://你的项目.你的子域.workers.dev/install-alpine.sh | sh -s install -id=<SERVER_ID> -secret=<SECRET> -url=<WORKER_URL> [-interval=60] [-ping=http] [-ct=xxx] [-cu=xxx] [-cm=xxx] [-bd=xxx] [-reset_day=1] [-rx_correction=N] [-tx_correction=N]
+curl -sL https://你的项目.你的子域.workers.dev/install-alpine.sh | sh -s install -id=<SERVER_ID> -secret=<SECRET> -url=<WORKER_URL> [-collect_interval=0] [-interval=60] [-ping=http] [-ct=xxx] [-cu=xxx] [-cm=xxx] [-bd=xxx] [-reset_day=1] [-rx_correction=N] [-tx_correction=N]
 ```
 
 OpenWrt / LEDE / ImmortalWrt 系统
 
 ```bash
-curl -sL https://你的项目.你的子域.workers.dev/install-openwrt.sh | sh -s install -id=<SERVER_ID> -secret=<SECRET> -url=<WORKER_URL> [-interval=60] [-ping=http] [-ct=xxx] [-cu=xxx] [-cm=xxx] [-bd=xxx] [-reset_day=1] [-rx_correction=N] [-tx_correction=N]
+curl -sL https://你的项目.你的子域.workers.dev/install-openwrt.sh | sh -s install -id=<SERVER_ID> -secret=<SECRET> -url=<WORKER_URL> [-collect_interval=0] [-interval=60] [-ping=http] [-ct=xxx] [-cu=xxx] [-cm=xxx] [-bd=xxx] [-reset_day=1] [-rx_correction=N] [-tx_correction=N]
 ```
 
 ### Windows 系统安装
 
-对于 Windows 系统，使用 Python 脚本安装探针：
+```powershell
+irm https://你的项目.你的子域.workers.dev/cf-server-monitor.ps1 -OutFile cf-server-monitor.ps1; powershell -ExecutionPolicy Bypass -File .\cf-server-monitor.ps1 install -Id <SERVER_ID> -Secret <SECRET> -Url <WORKER_URL> [-ReportInterval=60] [-PingType=tcp] [-CtNode=xxx] [-CuNode=xxx] [-CmNode=xxx] [-BdNode=xxx] [-ResetDay=1]
+```
 
-#### 安装依赖
+**其他命令**
 
-`pip install psutil pystray pillow`
+```powershell
+# 停止探针
+powershell -ExecutionPolicy Bypass -File .\cf-server-monitor.ps1 stop
 
-#### 下载探针脚本
+# 查看状态
+powershell -ExecutionPolicy Bypass -File .\cf-server-monitor.ps1 status
 
-[cf-server-monitor.pyw](public/cf-server-monitor.pyw)
+# 卸载服务
+powershell -ExecutionPolicy Bypass -File .\cf-server-monitor.ps1 uninstall
+```
+----
 
-#### 运行探针
-
-双击`cf-server-monitor.pyw`文件即可启动探针。
-
-**参数说明：**
+### 参数说明
 
 | 参数               | 说明                      | 默认值    |
 | ---------------- | ----------------------- | ------ |
 | `-id`            | 服务器唯一标识符（必填）            | -      |
 | `-secret`        | API 认证密钥（必填）            | -      |
 | `-url`           | Worker 上报地址（必填）         | -      |
+| `-collect_interval` | 数据采集间隔（秒），`0` 表示不额外采集并使用单条上报 | `0`    |
 | `-interval`      | 数据上报间隔（秒）               | `60`   |
 | `-ping`          | Ping 检测类型（`http`/`tcp`） | `http` |
 | `-ct`            | 自定义CT测试节点               | 默认节点   |
@@ -286,7 +302,7 @@ curl -sL https://你的项目.你的子域.workers.dev/install-openwrt.sh | sh -
 | `-rx_correction` | 下行流量校正（GB，直接设置当月下行数据）   | -      |
 | `-tx_correction` | 上行流量校正（GB，直接设置当月上行数据）   | -      |
 
-> **注意**：上报间隔越短，数据越实时，但会增加 API 调用和数据库存储。建议根据服务器数量和网络状况选择合适的间隔。
+> **注意**：`-collect_interval` 控制本机额外采集频率，`-interval` 控制向 Worker 上报频率。默认 `0` 为兼容模式：不额外采集，只按上报间隔发送单条数据；设置为 `1` 时才会 1 秒采集、按上报间隔批量发送。上报间隔越短，API 调用和数据库写入越多。
 
 </details>
 
@@ -385,7 +401,13 @@ curl -sL https://你的项目.你的子域.workers.dev/install-alpine.sh | sh -s
 curl -sL https://你的项目.你的子域.workers.dev/install-openwrt.sh | sh -s uninstall
 ```
 
-Windows 系统
+Windows 系统（PowerShell 版）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\cf-server-monitor.ps1 uninstall
+```
+
+Windows 系统（Python 版）
 
 启动cf-server-monitor.pyw后，GUI中关闭自启动（如已开启）。点删除，再删除这个文件即可
 
@@ -500,14 +522,22 @@ Windows 系统
 
 1. 创建 Telegram Bot（通过 [@BotFather](https://t.me/BotFather)）
 2. 获取 Bot Token
-3. 获取 Chat ID（通过 [@userinfobot](https://t.me/userinfobot)）
+3. 获取 Chat ID（通过 [@idbot](https://t.me/idbot)）
 4. 填入后台设置并开启
 
-**企业微信告警：**
+**企业微信 / 飞书 告警：**
 
 1. 创建群机器人，获取 Webhook URL
 2. 填入 Bot Token 字段
 3. Chat ID 留空
+
+**Bark 告警：**
+
+1. 获取 Bark 推送链接，比如 `https://api.day.app/xxxxxxx/这里改成你自己的推送内容` 删掉中文，保留 `https://api.day.app/xxxxxxx/`
+2. 填入 Bot Token 字段
+3. Chat ID 留空
+
+
 
 </details>
 
@@ -531,7 +561,8 @@ Windows 系统
 ```
 CF-Server-Monitor/
 ├── public/
-│   ├── cf-server-monitor.pyw   # Windows 探针脚本（.pyw 不显示 CMD 窗口）
+│   ├── cf-server-monitor.ps1   # Windows 探针脚本（PowerShell 版，零依赖）
+│   ├── cf-server-monitor.pyw   # Windows 探针脚本（Python 版，带 GUI）
 │   ├── install.sh              # 一键安装脚本 - systemd 系统 (Ubuntu/Debian/CentOS)
 │   ├── install-alpine.sh       # 一键安装脚本 - OpenRC 系统 (Alpine Linux)
 │   ├── install-openwrt.sh      # 一键安装脚本 - procd 系统 (OpenWrt/LEDE)
@@ -706,11 +737,10 @@ npm run deploy
 定时任务
 
 ```
-http://localhost:8787/cdn-cgi/handler/scheduled?cron=*/1+*+*+*+* // 每分钟执行一次（离线检测）
-http://localhost:8787/cdn-cgi/handler/scheduled?cron=0+*+*+*+* // 每小时执行一次（合并任务）
-http://localhost:8787/cdn-cgi/handler/scheduled?cron=*+*+1+*+* // 每月一号执行一次（测试使用）
-http://localhost:8787/cdn-cgi/handler/scheduled?cron=*+*+8+*+* // 每月8号执行一次（测试使用）
-http://localhost:8787/cdn-cgi/handler/scheduled?cron=0+12+*+*+* // 每天12点执行一次（测试使用）
+https://localhost:8787/cdn-cgi/handler/scheduled?cron=*/1+*+*+*+* // 每分钟执行一次（离线检测）
+https://localhost:8787/cdn-cgi/handler/scheduled?cron=0+*+*+*+* // 每小时执行一次（合并任务）
+https://localhost:8787/cdn-cgi/handler/scheduled?cron=0+0+*+*+0 // 每周执行一次（测试使用）
+https://localhost:8787/cdn-cgi/handler/scheduled?cron=0+12+*+*+* // 每天12点执行一次（测试使用）
 ```
 
 ### 本地测试数据
@@ -767,13 +797,17 @@ node test/api-check.js --help
 
 MIT License
 
-## 🙏 致谢
+## � 社区
 
-- [CF-Server-Monitor-Pro](https://github.com/a63414262/CF-Server-Monitor-Pro) 最初借鉴该项目，进行深度二次开发
+- [Telegram 群组](https://t.me/cfServerMonitor)
+
+## �🙏 致谢
+
+- [CF-Server-Monitor-Pro](https://github.com/a63414262/CF-Server-Monitor-Pro)
 - [Cloudflare Workers](https://workers.cloudflare.com/)
 - [Vue 3](https://vuejs.org/)
 - [Vite](https://vitejs.dev/)
 - [Chart.js](https://www.chartjs.org/)
 - [Leaflet](https://leafletjs.com/)
-- 感谢 [LINUX DO](https://linux.do/) 社区的支持与推广
+- 感谢 [LINUX DO](https://linux.do/) [NodeSeek](https://www.nodeseek.com/post-763025-1) 社区的支持与推广
 

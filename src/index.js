@@ -1,4 +1,4 @@
-import { initDatabase, monthlyCleanup, dropMetricsHistoryOld, getMetricsHistory, rebuildDatabase } from './database/schema.js';
+import { initDatabase, weeklyCleanup, getMetricsHistory, rebuildDatabase } from './database/schema.js';
 import { checkOfflineNodes, checkExpiringServers } from './services/notification.js';
 import { updateDatabase } from './database/updateDatabase.js';
 import { handleAdminAPI } from './handlers/admin.js';
@@ -18,8 +18,9 @@ import { MetricsBroadcaster as _MetricsBroadcaster }
 
 export class MetricsBroadcaster extends _MetricsBroadcaster {}
 
-async function getEncryptionKey(env) {
-  const secret = env.TURNSTILE_SECRET_KEY || env.API_SECRET || 'default_secret_key_for_turnstile_encryption';
+async function getEncryptionKey(env, sys) {
+  let secret = (sys && sys.jwt_secret) || env.TURNSTILE_SECRET_KEY || env.API_SECRET || 'default_secret_key_for_turnstile_encryption';
+  secret += '_turnstile';
   const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret));
   const keyMaterial = await crypto.subtle.importKey(
     'raw',
@@ -31,8 +32,8 @@ async function getEncryptionKey(env) {
   return keyMaterial;
 }
 
-async function encryptTurnstileData(data, env) {
-  const key = await getEncryptionKey(env);
+async function encryptTurnstileData(data, env, sys) {
+  const key = await getEncryptionKey(env, sys);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const encoder = new TextEncoder();
   const encodedData = encoder.encode(JSON.stringify(data));
@@ -47,9 +48,9 @@ async function encryptTurnstileData(data, env) {
   return btoa(String.fromCharCode(...combined));
 }
 
-async function decryptTurnstileData(encoded, env) {
+async function decryptTurnstileData(encoded, env, sys) {
   try {
-    const key = await getEncryptionKey(env);
+    const key = await getEncryptionKey(env, sys);
     const decoded = new Uint8Array(atob(encoded).split('').map(c => c.charCodeAt(0)));
     const iv = decoded.slice(0, 12);
     const ciphertext = decoded.slice(12);
@@ -66,13 +67,13 @@ async function decryptTurnstileData(encoded, env) {
   }
 }
 
-async function isTurnstileVerified(request, env) {
+async function isTurnstileVerified(request, env, sys) {
   const verifiedHeader = request.headers.get('X-Turnstile-Verified');
   
   if (!verifiedHeader) return false;
   
   try {
-    const decrypted = await decryptTurnstileData(verifiedHeader, env);
+    const decrypted = await decryptTurnstileData(verifiedHeader, env, sys);
     return decrypted && decrypted.expires && Date.now() < decrypted.expires * 1000;
   } catch {
     return false;
@@ -187,7 +188,7 @@ export default {
       // 全局 Turnstile 验证：仅 turnstile_enabled 开启时拦截所有 API 请求
       // turnstile_login_enabled 仅在登录时验证，不在此处拦截
       if (turnstileEnabled) {
-        const hasValidCookie = await isTurnstileVerified(request, env);
+        const hasValidCookie = await isTurnstileVerified(request, env, sys);
         
         if (!hasValidCookie) {
           const turnstileToken = request.headers.get('X-Turnstile-Token');
@@ -230,19 +231,23 @@ export default {
         let turnstileVerified = null;
 
         if (turnstileEnabled) {
-          verified = await isTurnstileVerified(request, env);
+          verified = await isTurnstileVerified(request, env, sys);
           if (setTurnstileVerified) {
             verified = true;
             const expires = Math.floor(Date.now() / 1000) + 3600;
             const cookieData = { expires, verified: true, timestamp: Date.now() };
-            turnstileVerified = await encryptTurnstileData(cookieData, env);
+            turnstileVerified = await encryptTurnstileData(cookieData, env, sys);
           }
         }
 
+        const isLoggedIn = await checkAuth(request, env, sys);
+
         return createSuccessResponse({
           version: getCurrentVersion(),
+          is_public: sys.is_public === 'true',
+          authorization: isLoggedIn,
           turnstile_enabled: turnstileEnabled,
-          turnstile_login_enabled: turnstileLoginEnabled,
+          turnstile_login_enabled: turnstileEnabled || turnstileLoginEnabled,
           turnstile_site_key: sys.turnstile_site_key || '',
           verified: verified,
           turnstile_verified: turnstileVerified,
@@ -301,7 +306,7 @@ export default {
         if (setTurnstileVerified) {
           const expires = Math.floor(Date.now() / 1000) + 3600;
           const cookieData = { expires, verified: true, timestamp: Date.now() };
-          const encryptedData = await encryptTurnstileData(cookieData, env);
+          const encryptedData = await encryptTurnstileData(cookieData, env, sys);
 
           const finalHeaders = new Headers(response.headers);
           finalHeaders.set('Access-Control-Allow-Origin', request.headers.get('Origin') || '');
@@ -334,19 +339,13 @@ export default {
       debug('[Cron] 离线节点检测完成');
     } else if (cron === '0 * * * *') {
       const now = new Date();
-      const day = now.getUTCDate();
+      const day = now.getUTCDay();
       const hour = now.getUTCHours();
       
-      if (day === 1 && hour === 0) {
-        debug('[Cron] 开始执行每月数据清理任务（表轮换）');
-        await monthlyCleanup(env.DB);
-        debug('[Cron] 每月数据清理任务完成');
-      }
-      
-      if (day === 8 && hour === 0) {
-        debug('[Cron] 开始执行每月8号清理旧表任务');
-        await dropMetricsHistoryOld(env.DB);
-        debug('[Cron] 每月8号清理旧表任务完成');
+      if (day === 0 && hour === 0) {
+        debug('[Cron] 开始执行每周数据清理任务（表轮换）');
+        await weeklyCleanup(env.DB);
+        debug('[Cron] 每周数据清理任务完成');
       }
       
       if (hour === 12) {
@@ -355,14 +354,10 @@ export default {
         debug('[Cron] 服务器到期检测完成');
       }
     }else if(env.DEBUG == 1){
-      if (cron === '* * 1 * *') {
-        debug('[Cron DEBUG] 开始执行每月数据清理任务（表轮换）');
-        await monthlyCleanup(env.DB);
-        debug('[Cron DEBUG] 每月数据清理任务完成');
-      } else if (cron === '* * 8 * *') {
-        debug('[Cron DEBUG] 开始执行每月8号清理旧表任务');
-        await dropMetricsHistoryOld(env.DB);
-        debug('[Cron DEBUG] 每月8号清理旧表任务完成');
+      if (cron === '0 0 * * 0') {
+        debug('[Cron DEBUG] 开始执行每周数据清理任务（表轮换）');
+        await weeklyCleanup(env.DB);
+        debug('[Cron DEBUG] 每周数据清理任务完成');
       } else if (cron === '0 12 * * *') {
         debug('[Cron DEBUG] 开始执行服务器到期检测');
         await checkExpiringServers(env.DB);

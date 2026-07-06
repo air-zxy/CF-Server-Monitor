@@ -62,6 +62,10 @@
         <span class="net-down">▼ {{ totalRx }}</span>
         <span class="net-up">▲ {{ totalTx }}</span>
       </div>
+      <div v-if="sysConfig.show_time" class="stat-row stat-time-row">
+        <span class="stat-key">TIME</span>
+        <span class="stat-time-value">{{ dataTimeText }}</span>
+      </div>
     </div>
     <div class="ping-panel">
       <div class="ping-item">
@@ -86,10 +90,10 @@
 
 <script setup>
 import { computed } from 'vue'
-import { formatBytes, getFlagRegionCode } from '../utils/api'
-import { t, currentLang } from '../utils/i18n'
-import { translations } from '../utils/i18n'
-import { TIME, PING } from '../utils/constants'
+import { formatBytes, getFlagRegionCode, getTrafficUsagePercent, isServerOnline } from '../utils/api'
+import { t, currentLang, useTranslation } from '../utils/i18n'
+import { PING } from '../utils/constants'
+import { normalizeTimestamp, formatDateTime } from '../utils/time.js'
 
 const props = defineProps({
   server: {
@@ -102,7 +106,8 @@ const props = defineProps({
       show_price: true,
       show_expire: true,
       show_bw: true,
-      show_tf: true
+      show_tf: true,
+      show_time: true
     })
   },
   to: {
@@ -111,16 +116,19 @@ const props = defineProps({
   }
 })
 
-const trans = computed(() => translations[currentLang.value] || translations.en)
+const trans = useTranslation()
 
-const now = Date.now()
+const currentTime = computed(() => {
+  const ts = Number(props.server.current_timestamp)
+  if (Number.isFinite(ts) && ts > 0) {
+    return ts < 10000000000 ? ts * 1000 : ts
+  }
+  return Date.now()
+})
 
 const regionCode = computed(() => getFlagRegionCode(props.server.region))
 
-const isOnline = computed(() => {
-  const lastUpdated = new Date(props.server.last_updated).getTime()
-  return (now - lastUpdated) < TIME.ONLINE_THRESHOLD_MS
-})
+const isOnline = computed(() => isServerOnline(props.server, currentTime.value))
 
 const statusColor = computed(() => isOnline.value ? 'var(--accent-green)' : 'var(--accent-red)')
 const statusText = computed(() => isOnline.value ? trans.value.online : trans.value.offline)
@@ -139,40 +147,38 @@ const diskPercent = computed(() => {
   return '0.00'
 })
 
-const trafficUsagePercent = computed(() => {
-  const limit = parseFloat(props.server.traffic_limit) || 0
-  if (limit <= 0) return '0'
-  
-  const limitBytes = limit * 1024 * 1024 * 1024
-  let usedBytes = 0
-  
-  const calcType = props.server.traffic_calc_type || 'total'
-  if (calcType === 'dl') {
-    usedBytes = parseFloat(props.server.net_rx_monthly) || 0
-  } else if (calcType === 'ul') {
-    usedBytes = parseFloat(props.server.net_tx_monthly) || 0
-  } else {
-    usedBytes = (parseFloat(props.server.net_rx_monthly) || 0) + (parseFloat(props.server.net_tx_monthly) || 0)
-  }
-  
-  const percent = (usedBytes / limitBytes) * 100
-  return percent.toFixed(1)
-})
+const trafficUsagePercent = computed(() => getTrafficUsagePercent(props.server))
 
 const netInSpeed = computed(() => formatBytes(props.server.net_in_speed))
 const netOutSpeed = computed(() => formatBytes(props.server.net_out_speed))
 const totalRx = computed(() => formatBytes(props.server.net_rx))
 const totalTx = computed(() => formatBytes(props.server.net_tx))
 
+const dataTimeText = computed(() => {
+  const reportTimestamp = normalizeTimestamp(props.server.report_timestamp ?? props.server.last_updated)
+  if (!isOnline.value) return formatDateTime(reportTimestamp)
+
+  const displayTimestamp = normalizeTimestamp(
+    props.server.display_timestamp ?? props.server.sample_timestamp ?? props.server.timestamp ?? reportTimestamp
+  )
+  const sampleTimestamp = normalizeTimestamp(
+    props.server.sample_timestamp ?? props.server.timestamp ?? displayTimestamp
+  )
+  const lagSeconds = displayTimestamp && sampleTimestamp
+    ? Math.max(0, Math.floor((displayTimestamp - sampleTimestamp) / 1000))
+    : 0
+  return `${formatDateTime(sampleTimestamp)}${lagSeconds > 0 ? ` (+${lagSeconds}s)` : ''}`
+})
+
 const isExpired = computed(() => {
   const expTime = new Date(props.server.expire_date).getTime()
-  return !isNaN(expTime) && expTime < now
+  return !isNaN(expTime) && expTime < currentTime.value
 })
 
 const expireText = computed(() => {
   const expTime = new Date(props.server.expire_date).getTime()
   if (isNaN(expTime)) return ''
-  const diff = expTime - now
+  const diff = expTime - currentTime.value
   const days = Math.ceil(diff / (1000 * 3600 * 24))
   return days > 0 ? `${days}${trans.value.expireDays}` : trans.value.expired
 })

@@ -7,7 +7,7 @@ import {
   getCacheDuration
 } from '../utils/cache.js';
 import { saveSiteOptions, debug } from '../utils/settings.js';
-import { addHistoryColumns } from './updateDatabase.js';
+import { addHistoryColumns, ensureHistoryIndex } from './updateDatabase.js';
 
 let dbInitialized = false;
 
@@ -33,6 +33,7 @@ export async function initDatabase(db) {
         traffic_limit TEXT DEFAULT '',
         traffic_calc_type TEXT DEFAULT 'total',
         reset_day INTEGER DEFAULT 1,
+        collect_interval INTEGER DEFAULT 0,
         report_interval INTEGER DEFAULT 60,
         ping_mode TEXT DEFAULT 'http',
         is_hidden TEXT DEFAULT '0',
@@ -79,15 +80,11 @@ export async function initDatabase(db) {
         ip_v6 TEXT DEFAULT '0',
         boot_time TEXT DEFAULT '',
         net_rx_monthly REAL DEFAULT 0,
-        net_tx_monthly REAL DEFAULT 0,
-        FOREIGN KEY (server_id) REFERENCES servers(id)
+        net_tx_monthly REAL DEFAULT 0
       )
     `).run();
 
-    await db.prepare(`
-      CREATE INDEX IF NOT EXISTS idx_history_server_time 
-      ON metrics_history(server_id, timestamp)
-    `).run();
+    await ensureHistoryIndex(db);
 
     debug('✅ 数据库初始化完成');
     dbInitialized = true;
@@ -176,13 +173,11 @@ export async function getMetricsHistory(db, serverId, hours, columns) {
   );
 
   // 判断是否需要查询 metrics_history_old 表
-  // 获取当前月份的第一天 00:00:00 的时间戳
+  // 如果 cutoff 早于本周日 00:00 UTC（表轮换时间），说明需要查旧表
   const nowDate = new Date(now);
-  const currentMonthStart = new Date(nowDate.getFullYear(), nowDate.getMonth(), 1).getTime();
-  
-  // 如果 cutoff 在当前月份之前，说明需要查询旧表
-  const needOldTable = cutoff < currentMonthStart;
-  // const needOldTable = true;
+  const day = nowDate.getUTCDay();
+  const thisSunday = new Date(Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth(), nowDate.getUTCDate() - day));
+  const needOldTable = cutoff < thisSunday.getTime();
   
   // 检查 metrics_history_old 表是否存在
   let oldTableExists = false;
@@ -196,9 +191,9 @@ export async function getMetricsHistory(db, serverId, hours, columns) {
   let rawResult;
   
   if (needOldTable && oldTableExists) {
-    // 跨月查询，使用 UNION ALL
-    debug('[History] 跨月查询，合并 metrics_history 和 metrics_history_old');
-    
+    // 跨周查询，使用 UNION ALL 合并两个表
+    debug('[History] 跨周查询，合并 metrics_history 和 metrics_history_old');
+
     rawResult = await db.prepare(`
       WITH sampled AS (
         SELECT 
@@ -262,18 +257,8 @@ export async function getMetricsHistory(db, serverId, hours, columns) {
   return result;
 }
 
-export async function dropMetricsHistoryOld(db) {
-  try {
-    await db.prepare(`DROP TABLE IF EXISTS metrics_history_old`).run();
-    debug('[Cleanup] 已删除 metrics_history_old 表');
-    return { success: true };
-  } catch (e) {
-    console.error('[Cleanup] 删除 metrics_history_old 表失败:', e);
-    return { success: false, error: e.message };
-  }
-}
 
-export async function monthlyCleanup(db) {
+export async function weeklyCleanup(db) {
   try {
     debug('[Cleanup] 开始执行表轮换操作...');
     
@@ -310,9 +295,12 @@ export async function monthlyCleanup(db) {
   }
 }
 
-export async function saveMetricsHistory(db, serverId, metrics, regionCode = '') {
+export async function saveMetricsHistory(db, serverId, metrics, regionCode = '', timestamp = null) {
   try {
-    const now = Date.now();
+    const rawTimestamp = Number(timestamp);
+    const now = Number.isFinite(rawTimestamp) && rawTimestamp > 0
+      ? (rawTimestamp < 10000000000 ? rawTimestamp * 1000 : rawTimestamp)
+      : Date.now();
     
     const parsePing = (val) => {
       if (val === '' || val === null || val === undefined) return null;
@@ -421,6 +409,9 @@ export async function getLatestMetricsForAllServers(db) {
   if (cacheInfo.cache && now - cacheInfo.time < cacheInfo.ttl) {
     return cacheInfo.cache;
   }
+
+  // 确保 metrics_history 表有 idx_history_server_time 索引
+  await ensureHistoryIndex(db);
 
   try {
     const servers = await getAllServers(db);

@@ -17,8 +17,10 @@ const computeWsBase = (origin) => {
 
 const setApiBases = (values) => {
   apiBases = values.map(v => stripTrailingSlash(v)).filter(v => v)
-  const first = apiBases.length > 0 ? apiBases[0] : stripTrailingSlash(window.location.origin)
-  wsBase = computeWsBase(first)
+  if (apiBases.length === 0) {
+    apiBases = [stripTrailingSlash(window.location.origin)]
+  }
+  wsBase = computeWsBase(apiBases[0])
   window.__APP_API_BASES__ = apiBases
   window.__APP_WS_BASE__ = wsBase
 }
@@ -26,7 +28,7 @@ const setApiBases = (values) => {
 export const initConfig = async () => {
   setApiBases([window.location.origin])
   try {
-    const res = await fetch(`/config.json?t=${Date.now()}`, {
+    const res = await fetch(`./config.json?t=${Date.now()}`, {
       cache: 'no-cache',
       credentials: 'omit'
     })
@@ -50,7 +52,7 @@ export const initConfig = async () => {
 
 export const getApiBases = () => {
   if (apiBases.length > 0) return apiBases
-  if (window.__APP_API_BASES__) return window.__APP_API_BASES__
+  if (window.__APP_API_BASES__?.length > 0) return window.__APP_API_BASES__
   return [stripTrailingSlash(window.location.origin)]
 }
 

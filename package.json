@@ -1,6 +1,6 @@
 {
   "name": "cf-server-monitor",
-  "version": "2.7.5",
+  "version": "2.7.8",
   "description": "Cloudflare Workers Server Monitor - 多服务器监控探针",
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
     "tail": "wrangler tail",
     "dev:frontend": "vite",
     "build:frontend": "node scripts/build.js",
+    "build:github-page": "node scripts/build-github-page.js",
     "preview": "vite preview"
   },
   "keywords": [

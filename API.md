@@ -77,9 +77,10 @@
 - **使用位置**：`POST /admin/api` 的 `action: login`
 - **方式**：请求体字段 `username` / `password`（后端内部组装 `Basic base64(user:pass)` 进行校验）
 - **校验顺序**：
-  1. 若 `site_options.password` 已设置 → 与其 MD5 比对
-  2. 否则 → 与 `API_SECRET` 直接比对
-  3. 用户名：若 `site_options.username` 已设置则用之，否则使用 `API_USER_NAME` 环境变量，最终回退为 `admin`
+  1. 若 `site_options.password` 已设置为 PBKDF2 格式 → 按 `pbkdf2_sha256$iterations$salt$hash` 校验
+  2. 若 `site_options.password` 为旧版 32 位 MD5 → 按 MD5 兼容校验，成功后自动升级为 PBKDF2
+  3. 若 `site_options.password` 未设置或为空 → 与 `API_SECRET` 直接比对
+  4. 用户名：若 `site_options.username` 已设置则用之，否则使用 `API_USER_NAME` 环境变量，最终回退为 `admin`
 - **失败返回**：`401 { "error": "Invalid username or password", "code": 401 }`
 
 #### C. JWT Bearer（管理操作 → 后续管理请求）
@@ -251,6 +252,22 @@ CORS_ALLOWED_ORIGINS=https://status.example.com,https://admin.example.com
   }
   ```
 
+  新版探针也可以一次上报多个采集样本，后端兼容旧的单条 `metrics` 格式。批量格式示例：
+
+  ```json
+  {
+    "id": "9b2c4d3e-1a2b-4c5d-9e8f-7a6b5c4d3e2f",
+    "secret": "<API_SECRET>",
+    "metrics": { "...": "latest metrics, kept for compatibility" },
+    "samples": [
+      { "ts": 1737638340000, "metrics": { "...": "metrics at this timestamp" } },
+      { "ts": 1737638341000, "metrics": { "...": "metrics at this timestamp" } }
+    ],
+    "collect_interval": 1,
+    "report_interval": 60
+  }
+  ```
+
 **字段说明（metrics）**：
 
 | 字段               | 类型           | 单位  | 必填 | 说明                                          |
@@ -305,8 +322,8 @@ CORS_ALLOWED_ORIGINS=https://status.example.com,https://admin.example.com
 
 **副作用**
 
-1. 插入一行到 `metrics_history`。
-2. 触发 Durable Object `MetricsBroadcaster` 内部广播，WebSocket 订阅者将立即收到 `{type:"update", serverId, ts, data}` 消息。
+1. `metrics_history` 只写入本次请求中最新的一个样本，避免 1 秒采集时放大 D1 写入次数。
+2. 触发 Durable Object `MetricsBroadcaster` 内部广播，统一发送 `{type:"batchUpdate", ts, updates:[...]}` 格式，前端按样本时间逐个回放。
 3. 写入 `request.cf.country`（或 `cf-ipcountry` Header）作为该条记录的 `region` 字段（统一转大写）。
 
 ***
@@ -417,6 +434,7 @@ CORS_ALLOWED_ORIGINS=https://status.example.com,https://admin.example.com
   "traffic_limit": "1TB",
   "traffic_calc_type": "total",
   "reset_day": 1,
+  "collect_interval": 1,
   "report_interval": 60,
   "ping_mode": "http",
   "is_hidden": "0",
@@ -558,7 +576,9 @@ Sec-WebSocket-Version: 13
 | 订阅类型 | 推送方式 | 消息类型 | 说明 |
 | -------- | ----- | ----- | --- |
 | `subscribe=all` | 批量合并，每 5 秒一次 | `batchUpdate` | 减少消息数量，降低前端渲染压力 |
-| `subscribe=<serverId>` | 实时推送 | `update` | 单台服务器详情页，低延迟 |
+| `subscribe=<serverId>` | 实时推送 | `batchUpdate` | 单台服务器详情页，低延迟，统一消息格式 |
+
+> `subscribe=all` 默认不推送任何服务器更新。客户端应先调用 `/api/servers` 获取当前可见服务器列表，再通过 WebSocket 通道发送 `subscribe` 消息，使用 `servers[].id` 作为过滤列表。该过滤是客户端订阅范围控制，不是服务端鉴权。
 
 **服务端 → 客户端消息**：
 
@@ -566,16 +586,7 @@ Sec-WebSocket-Version: 13
    ```json
    { "type": "hello", "ts": 1737638400000, "subscribed": "all" }
    ```
-2. 指标更新——实时（`subscribe=<serverId>` 时使用）
-   ```json
-   {
-     "type": "update",
-     "serverId": "9b2c...",
-     "ts": 1737638400000,
-     "data": { /* 见 Server 对象(已 merge metrics) */ }
-   }
-   ```
-3. 指标更新——批量（`subscribe=all` 时使用，每 5 秒合并一次）
+2. 指标更新（统一使用 `batchUpdate`，`subscribe=all` 和 `subscribe=<serverId>` 均支持）
    ```json
    {
      "type": "batchUpdate",
@@ -583,13 +594,25 @@ Sec-WebSocket-Version: 13
      "updates": [
        {
          "serverId": "9b2c...",
-         "ts": 1737638398000,
-         "data": { /* Server 对象 */ }
+         "samples": [
+           {
+             "ts": 1737638398000,
+             "data": { /* Server 对象 */ }
+           },
+           {
+             "ts": 1737638399000,
+             "data": { /* Server 对象 */ }
+           }
+         ]
        },
        {
          "serverId": "a1f3...",
-         "ts": 1737638399000,
-         "data": { /* Server 对象 */ }
+         "samples": [
+           {
+             "ts": 1737638398500,
+             "data": { /* Server 对象 */ }
+           }
+         ]
        }
      ]
    }
@@ -598,8 +621,22 @@ Sec-WebSocket-Version: 13
 **客户端 → 服务端消息**（可选）：
 
 ```json
+{ "type": "subscribe", "scope": "all", "ids": ["server-001", "server-002"] }
 { "type": "ping" }   // → 服务端回 { "type": "pong", "ts": ... }
 { "type": "pong" }   // 静默忽略
+```
+
+`subscribe` 消息用于更新当前 WebSocket 的订阅范围：
+
+- `scope`：可选，默认沿用 URL 中的 `subscribe`，通常为 `all`
+- `ids`：可选数组，来自 `/api/servers` 返回的 `servers[].id`；`subscribe=all` 时仅推送这些 ID 的更新。最多 500 个，每个 ID 长度 1-64，仅允许字母、数字、`.`、`_`、`:`、`-`
+
+若 `scope` 或 `ids` 格式非法，服务端会关闭 WebSocket 连接（close code `1008`）。
+
+服务端确认消息：
+
+```json
+{ "type": "subscribed", "ts": 1737638400000, "subscribed": "all", "count": 2 }
 ```
 
 **失败返回**：
@@ -610,7 +647,12 @@ Sec-WebSocket-Version: 13
 **前端使用示例（subscribe=all，批量推送）**：
 
 ```js
+const { servers } = await (await fetch('/api/servers')).json();
+const ids = servers.map(s => s.id);
 const ws = new WebSocket('wss://status.example.com/api/ws?subscribe=all');
+ws.onopen = () => {
+  ws.send(JSON.stringify({ type: 'subscribe', scope: 'all', ids }));
+};
 ws.onmessage = (ev) => {
   const msg = JSON.parse(ev.data);
   if (msg.type === 'batchUpdate') {
@@ -628,8 +670,12 @@ ws.onmessage = (ev) => {
 const ws = new WebSocket('wss://status.example.com/api/ws?subscribe=server-001');
 ws.onmessage = (ev) => {
   const msg = JSON.parse(ev.data);
-  if (msg.type === 'update') {
-    updateServer(msg.serverId, msg.data);
+  if (msg.type === 'batchUpdate') {
+    for (const u of msg.updates) {
+      for (const s of u.samples) {
+        updateServer(u.serverId, s.data);
+      }
+    }
   }
 };
 ```
@@ -842,7 +888,7 @@ Header：`X-Turnstile-Token: <token>`（当 `site_options.turnstile_enabled === 
     "turnstile_secret_key": "",
     "jwt_secret": "",
     "username": "admin",
-    "password": "<plain text, will be MD5-hashed before save>",
+    "password": "<plain text, will be PBKDF2-hashed before save>",
     "cloudflare_account_id": "",
     "cloudflare_token": "",
     "custom_ct": "gd-ct-dualstack.ip.zstaticcdn.com",
@@ -863,7 +909,7 @@ Header：`X-Turnstile-Token: <token>`（当 `site_options.turnstile_enabled === 
 
 **特殊处理**：
 
-- `password`：以**明文**传入；后端用 `crypto.subtle.digest('MD5', ...)` 计算后保存；如传空字符串则**不更新**密码
+- `password`：以**明文**传入；后端用 PBKDF2-HMAC-SHA-256（50,000 iterations、16 字节 salt、32 字节 hash）计算后保存为 `pbkdf2_sha256$50000$<salt hex>$<hash hex>`；如传空字符串则**不更新**密码；旧版 32 位 MD5 哈希仍可登录并会在成功登录后自动升级
 
 **Response 200**
 
@@ -917,6 +963,7 @@ Header：`X-Turnstile-Token: <token>`（当 `site_options.turnstile_enabled === 
   "traffic_limit": "1TB",
   "traffic_calc_type": "total",       // total | ...
   "reset_day": 1,                     // 1 ~ 31
+  "collect_interval": 1,              // 秒
   "report_interval": 60,              // 秒
   "ping_mode": "http",                // http | tcp
   "is_hidden": "0"                    // "0" | "1"
@@ -1083,6 +1130,7 @@ Header：`X-Turnstile-Token: <token>`（当 `site_options.turnstile_enabled === 
 | `traffic_limit`                               | string             | 流量上限文本                    |
 | `traffic_calc_type`                           | string             | `total` / 其他              |
 | `reset_day`                                   | number             | 流量重置日 1\~31               |
+| `collect_interval`                            | number             | 采集间隔（秒）                   |
 | `report_interval`                             | number             | 上报间隔（秒）                   |
 | `ping_mode`                                   | string             | `http` / `tcp`            |
 | `is_hidden`                                   | string `"0"`/`"1"` | 是否在前台隐藏                   |
@@ -1152,7 +1200,7 @@ Header：`X-Turnstile-Token: <token>`（当 `site_options.turnstile_enabled === 
   turnstile_secret_key: string,
   jwt_secret: string,            // 长度 ≥ 32 才会被用于签 JWT
   username: string,
-  password: string,              // MD5 哈希值
+  password: string,              // PBKDF2 哈希值；旧版 MD5 哈希会在成功登录后自动升级
   cloudflare_account_id: string,
   cloudflare_token: string,
   custom_ct: string,             // 电信测速节点域名
@@ -1169,6 +1217,8 @@ Header：`X-Turnstile-Token: <token>`（当 `site_options.turnstile_enabled === 
 | `type`   | 方向    | Payload                                            |
 | -------- | ----- | -------------------------------------------------- |
 | `hello`  | S → C | `{ ts: number, subscribed: string }`               |
+| `subscribe` | C → S | `{ scope: string, ids: string[] }`              |
+| `subscribed` | S → C | `{ ts: number, subscribed: string, count: number }` |
 | `ping`   | S → C | `{ ts: number }`                                   |
 | `pong`   | 双向    | `{ ts: number }`                                   |
 | `update` | S → C | `{ serverId: string, ts: number, data: <Server> }` |
@@ -1183,14 +1233,12 @@ Worker 同时注册了 cron 触发器（`scheduled` handler），可在 `wrangle
 | ------------- | --------------- | -------------------------------------------------------------- |
 | `*/1 * * * *` | 每分钟：检测离线节点      | `checkOfflineNodes`（通知）                                        |
 | `0 * * * *`   | 每小时：根据 UTC 日期分支 | 见下表                                                            |
-| <br />        | 每月 1 号 0 点：表轮换  | `monthlyCleanup`（重命名 metrics\_history → metrics\_history\_old） |
-| <br />        | 每月 8 号 0 点：删除旧表 | `dropMetricsHistoryOld`                                        |
+| <br />        | 每周日 0 点：表轮换    | `weeklyCleanup`（删除旧表、重命名 metrics\_history → metrics\_history\_old、创建新表） |
 | <br />        | 每天 12 点：服务器到期检测 | `checkExpiringServers`                                         |
 
 DEBUG 模式（`env.DEBUG=1`）下额外提供：
 
-- `* * 1 * *` → monthlyCleanup
-- `* * 8 * *` → dropMetricsHistoryOld
+- `0 0 * * 0` → weeklyCleanup
 - `0 12 * * *` → checkExpiringServers
 
 ***
@@ -1353,6 +1401,7 @@ curl https://status.example.com/__do/health
 ```bash
 # 订阅所有服务器
 wscat -c "wss://status.example.com/api/ws?subscribe=all"
+# 建连后发送：{"type":"subscribe","scope":"all","ids":["server-id"]}
 
 # 订阅指定服务器
 wscat -c "wss://status.example.com/api/ws?subscribe=9b2c4d3e-1a2b-4c5d-9e8f-7a6b5c4d3e2f"
@@ -1371,4 +1420,3 @@ wscat -c "wss://status.example.com/api/ws?subscribe=9b2c4d3e-1a2b-4c5d-9e8f-7a6b
 ***
 
 > 文档同步：与源码 `src/index.js`、`src/handlers/{admin,dashboard,frontend,update}.js`、`src/durable/MetricsBroadcaster.js`、`src/utils/{auth,settings,errors,cors,cache,metrics,common}.js`、`src/database/{schema,updateDatabase}.js` 一一对应；后续修改任一文件时，请同步更新本文件。
-
