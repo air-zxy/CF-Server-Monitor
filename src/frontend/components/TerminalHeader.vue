@@ -43,17 +43,19 @@
           >☀</button>
         </div>
       </div>
-      <router-link :to="isAdminPage ? '/' : '/admin'" class="admin-link-header">⚙ {{ isAdminPage ? t('dashboard') : t('admin') }}</router-link>
+      <a v-if="isAdminPage" href="/#/" class="admin-link-header">⚙ {{ t('dashboard') }}</a>
+      <a v-else :href="adminHref" class="admin-link-header">⚙ {{ t('admin') }}</a>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { t, setLanguage, getLanguage } from '../utils/i18n'
 import { useTheme } from '../composables/useTheme'
 import { DEFAULT_SITE_TITLE } from '../utils/constants'
+import { hasMultipleApiBases } from '../utils/config'
 
 defineProps({
   title: {
@@ -66,6 +68,7 @@ const { currentTheme, setTheme } = useTheme()
 const currentLang = ref('en')
 const route = useRoute()
 const isAdminPage = ref(route.path === '/admin')
+const adminHref = computed(() => hasMultipleApiBases() ? '/#/admin' : '/admin#/admin')
 
 const setLang = (lang) => {
   setLanguage(lang)

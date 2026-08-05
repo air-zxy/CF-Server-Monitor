@@ -9,13 +9,26 @@ const DEFAULT_ERROR_MESSAGES = {
 
 const TURNSTILE_VERIFIED_KEY = 'turnstile_verified'
 
-const getAdminHash = () => {
-  return '#/admin'
+const getAdminPath = () => {
+  return '/admin'
+}
+
+const redirectToAdminLogin = () => {
+  if (typeof window === 'undefined') return
+
+  const adminPath = getAdminPath()
+  if (window.location.pathname === adminPath || window.location.pathname.startsWith(`${adminPath}/`)) {
+    window.location.reload()
+    return
+  }
+
+  window.location.assign(adminPath)
 }
 
 const createHeaders = (includeAuth = true, includeTurnstile = true, baseUrl = null, options = {}) => {
   const {
-    includeTurnstileToken = includeTurnstile
+    includeTurnstileToken = includeTurnstile,
+    includeTurnstileVerified = true
   } = options
   const headers = {
     'Content-Type': 'application/json'
@@ -35,9 +48,11 @@ const createHeaders = (includeAuth = true, includeTurnstile = true, baseUrl = nu
     }
   }
 
-  const turnstileVerified = localStorage.getItem(TURNSTILE_VERIFIED_KEY)
-  if (turnstileVerified) {
-    headers['X-Turnstile-Verified'] = turnstileVerified
+  if (includeTurnstileVerified) {
+    const turnstileVerified = localStorage.getItem(TURNSTILE_VERIFIED_KEY)
+    if (turnstileVerified) {
+      headers['X-Turnstile-Verified'] = turnstileVerified
+    }
   }
   
   return headers
@@ -49,7 +64,7 @@ const handleResponse = async (res, options = {}) => {
   if (res.status === 401) {
     localStorage.removeItem('jwt_token')
     if (autoRedirect) {
-      window.location.hash = getAdminHash()
+      redirectToAdminLogin()
     }
     return { error: DEFAULT_ERROR_MESSAGES[401], status: 401 }
   }

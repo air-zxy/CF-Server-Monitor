@@ -1,13 +1,20 @@
+import { debug, getSettingByKey } from '../utils/settings.js';
+import {
+  detectBillingCycle,
+  detectCurrencySymbol,
+  normalizeBillingCycle,
+  normalizeCurrency,
+  normalizePrice
+} from '../utils/serverBilling.js';
+
+
 export async function updateDatabase(db) {
-  console.log('开始执行数据库更新...');
+  debug('开始执行数据库更新...');
   const results = [];
   
   try {
     const historyIndex = await ensureHistoryIndex(db);
     results.push({ name: 'metrics_history 索引检查', ...historyIndex });
-
-    const migrateLoad = await migrateLoadToLoadAvg(db);
-    results.push({ name: 'metrics_history load -> load_avg 迁移', ...migrateLoad });
     
     const serversCols = await addServerColumns(db);
     results.push({ name: 'servers 表列更新', ...serversCols });
@@ -26,7 +33,7 @@ export async function updateDatabase(db) {
     const dropAggregated = await dropMetricsAggregatedTable(db);
     results.push({ name: '删除弃用的 metrics_aggregated 表', ...dropAggregated });
     
-    console.log('✅ 数据库更新完成');
+    debug('✅ 数据库更新完成');
     
     return {
       success: true,
@@ -34,7 +41,7 @@ export async function updateDatabase(db) {
       results
     };
   } catch (e) {
-    console.error('❌ 数据库更新失败:', e);
+    debug('❌ 数据库更新失败:', e);
     return {
       success: false,
       message: 'databaseUpgradeFailed',
@@ -44,15 +51,52 @@ export async function updateDatabase(db) {
   }
 }
 
-// 确保 metrics_history 表有 索引
+export async function isHistoryOptimized(db) {
+  const history_id_optimized = await getSettingByKey(db, 'history_id_optimized', true);
+  if(history_id_optimized) return true;
+  const minId = await db.prepare(`
+    SELECT id AS min_id
+    FROM metrics_history
+    ORDER BY id ASC
+    LIMIT 1
+  `).first();
+  if(!minId) return true;  // 空表，视为已优化
+  return minId.min_id > 10000000000000;
+}
+
+// 确保 旧版metrics_history 表有索引
 export async function ensureHistoryIndex(db) {
+  const history_id_optimized = await getSettingByKey(db, 'history_id_optimized', true);
+  if(history_id_optimized) {
+    debug('metrics_history 表已优化，无需创建索引');
+    return { success: true, created: false, message: 'metrics_history 表已优化，无需创建索引'};
+  }
+  
   try {
     const index = await db.prepare(
       `SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='metrics_history'`
     ).first();
 
     if (index) {
+      debug('索引已存在无需创建');
       return { success: true, created: false, message: '索引已存在' };
+    }
+
+    // 获取最小id
+     const minId = await db.prepare(`
+      SELECT id AS min_id
+      FROM metrics_history
+      ORDER BY id ASC
+      LIMIT 1
+    `).first();
+
+    if (!minId || minId.min_id > 10000000000000) {
+      debug('metrics_history 表为空或已优化，无需创建索引');
+      return {
+        success: true,
+        created: false,
+        message: 'metrics_history 表为空或已优化，无需创建索引'
+      };
     }
 
     const idxName = 'idx_history_server_time_' + Math.random().toString(36).substring(2);
@@ -61,40 +105,11 @@ export async function ensureHistoryIndex(db) {
       CREATE INDEX IF NOT EXISTS ${idxName} 
       ON metrics_history(server_id, timestamp)
     `).run();
+    debug(`✅ 已创建索引 ${idxName}`);
 
     return { success: true, created: true, message: '已创建索引' };
   } catch (e) {
-    console.error('检查/创建 metrics_history 索引失败:', e);
-    return { success: false, error: e.message };
-  }
-}
-
-async function migrateLoadToLoadAvg(db) {
-  try {
-    const { results: columns } = await db.prepare(`PRAGMA table_info(metrics_history)`).all();
-    const existingCols = columns.map(c => c.name);
-    
-    if (!existingCols.includes('load')) {
-      return { success: true, migrated: 0, message: '无需迁移（没有旧的 load 字段）' };
-    }
-    
-    let migrated = 0;
-    
-    if (!existingCols.includes('load_avg')) {
-      await db.prepare(`ALTER TABLE metrics_history ADD COLUMN load_avg TEXT DEFAULT '0'`).run();
-    }
-    
-    const { meta: updateResult } = await db.prepare(
-      `UPDATE metrics_history SET load_avg = load WHERE load IS NOT NULL AND load_avg = '0'`
-    ).run();
-    migrated = updateResult.changes;
-    
-    await db.prepare(`ALTER TABLE metrics_history DROP COLUMN load`).run();
-    console.log(`✅ 已迁移 ${migrated} 条记录的 load -> load_avg`);
-    
-    return { success: true, migrated, message: `已迁移 ${migrated} 条记录并删除旧字段` };
-  } catch (e) {
-    console.error('迁移 load -> load_avg 失败:', e);
+    debug('检查/创建 metrics_history 索引失败:', e);
     return { success: false, error: e.message };
   }
 }
@@ -103,28 +118,64 @@ export async function addServerColumns(db) {
   try {
     const { results: columns } = await db.prepare(`PRAGMA table_info(servers)`).all();
     const existingCols = columns.map(c => c.name);
+    const shouldMigrateLegacyPrice = !existingCols.includes('billing_cycle');
     
     const newCols = {
       is_hidden: "TEXT DEFAULT '0'",
+      offline_notify_disabled: "TEXT DEFAULT '0'",
       sort_order: "INTEGER DEFAULT 0",
+      region: "TEXT DEFAULT ''",
+      tags: "TEXT DEFAULT ''",
+      note: "TEXT DEFAULT ''",
+      billing_cycle: "TEXT DEFAULT 'month'",
+      auto_renewal: "TEXT DEFAULT '0'",
+      currency: "TEXT DEFAULT '¥'",
       reset_day: "INTEGER DEFAULT 1",
       collect_interval: "INTEGER DEFAULT 0",
       report_interval: "INTEGER DEFAULT 60",
-      ping_mode: "TEXT DEFAULT 'http'",
-      traffic_calc_type: "TEXT DEFAULT 'total'"
+      auto_update: "TEXT DEFAULT '0'",
+      custom_ct: "TEXT DEFAULT ''",
+      custom_cu: "TEXT DEFAULT ''",
+      custom_cm: "TEXT DEFAULT ''",
+      custom_bd: "TEXT DEFAULT ''",
+      rx_correction: "REAL DEFAULT NULL",
+      tx_correction: "REAL DEFAULT NULL",
+      traffic_calc_type: "TEXT DEFAULT 'total'",
+      interface: "TEXT DEFAULT ''",
+      history_partition_id: "INTEGER DEFAULT 0",
+      timestamp: "INTEGER DEFAULT 0"
     };
     
     let added = 0;
     for (const [colName, colDef] of Object.entries(newCols)) {
       if (!existingCols.includes(colName)) {
-        await db.prepare(`ALTER TABLE servers ADD COLUMN ${colName} ${colDef}`).run();
+        const colSqlName = colName === 'interface' ? '"interface"' : colName;
+        await db.prepare(`ALTER TABLE servers ADD COLUMN ${colSqlName} ${colDef}`).run();
         added++;
       }
     }
+
+    let migratedPrices = 0;
+    if (shouldMigrateLegacyPrice) {
+      const { results: servers = [] } = await db.prepare(
+        `SELECT id, price FROM servers`
+      ).all();
+
+      for (const server of servers) {
+        const normalizedPrice = normalizePrice(server.price);
+        const billingCycle = normalizeBillingCycle(detectBillingCycle(server.price));
+        const currency = normalizeCurrency(detectCurrencySymbol(server.price) || '¥');
+
+        await db.prepare(
+          `UPDATE servers SET price = ?, billing_cycle = ?, currency = ? WHERE id = ?`
+        ).bind(normalizedPrice, billingCycle, currency, server.id).run();
+        migratedPrices++;
+      }
+    }
     
-    return { success: true, added };
+    return { success: true, added, migratedPrices };
   } catch (e) {
-    console.error('添加 servers 表列失败:', e);
+    debug('添加 servers 表列失败:', e);
     return { success: false, error: e.message };
   }
 }
@@ -134,7 +185,7 @@ async function cleanupServerExtraColumns(db) {
     const { results: columns } = await db.prepare(`PRAGMA table_info(servers)`).all();
     const existingCols = columns.map(c => c.name);
     
-    const extraCols = ['cpu', 'ram', 'disk', 'load_avg', 'uptime', 'last_updated', 'ram_total', 'net_rx', 'net_tx', 'net_in_speed', 'net_out_speed', 'os', 'cpu_info', 'cpu_cores' , 'arch' ,'boot_time', 'ram_used', 'swap_total', 'swap_used', 'disk_total', 'disk_used', 'processes', 'tcp_conn', 'udp_conn', 'country', 'ip_v4', 'ip_v6', 'ping_ct', 'ping_cu', 'ping_cm', 'ping_bd', 'monthly_rx', 'monthly_tx', 'last_rx', 'last_tx', 'reset_month'];
+    const extraCols = ['cpu', 'ram', 'disk', 'load_avg', 'uptime', 'last_updated', 'ram_total', 'net_rx', 'net_tx', 'net_in_speed', 'net_out_speed', 'os', 'cpu_info', 'cpu_cores' , 'arch' ,'boot_time', 'ram_used', 'swap_total', 'swap_used', 'disk_total', 'disk_used', 'processes', 'tcp_conn', 'udp_conn', 'country', 'ip_v4', 'ip_v6', 'ping_ct', 'ping_cu', 'ping_cm', 'ping_bd', 'monthly_rx', 'monthly_tx', 'last_rx', 'last_tx', 'reset_month', 'bandwidth', 'ping_mode'];
     const colsToDrop = extraCols.filter(col => existingCols.includes(col));
     
     if (colsToDrop.length === 0) {
@@ -143,28 +194,26 @@ async function cleanupServerExtraColumns(db) {
     
     for (const col of colsToDrop) {
       await db.prepare(`ALTER TABLE servers DROP COLUMN ${col}`).run();
-      console.log(`✅ 已删除 servers 表的 ${col} 字段`);
+      debug(`✅ 已删除 servers 表的 ${col} 字段`);
     }
     
     return { success: true, cleaned: colsToDrop.length, message: `已删除 ${colsToDrop.join(', ')} 字段` };
   } catch (e) {
-    console.error('清理 servers 表多余字段失败:', e);
+    debug('清理 servers 表多余字段失败:', e);
     return { success: false, error: e.message };
   }
 }
 
 export async function addHistoryColumns(db) {
   try {
-    const { results: historyColumns } = await db.prepare(`PRAGMA table_info(metrics_history)`).all();
-    const existingHistoryCols = historyColumns.map(c => c.name);
-    
     const newHistoryCols = {
       cpu_cores: "INTEGER DEFAULT 0",
       cpu_info: "TEXT DEFAULT ''",
-      gpu: "REAL DEFAULT NULL",
+      agent_version: "TEXT DEFAULT ''",
       gpu_info: "TEXT DEFAULT ''",
       arch: "TEXT DEFAULT ''",
       os: "TEXT DEFAULT ''",
+      kernel_version: "TEXT DEFAULT ''",
       region: "TEXT DEFAULT ''",
       ip_v4: "TEXT DEFAULT '0'",
       ip_v6: "TEXT DEFAULT '0'",
@@ -176,24 +225,35 @@ export async function addHistoryColumns(db) {
       loss_cm: "INTEGER DEFAULT NULL",
       loss_bd: "INTEGER DEFAULT NULL"
     };
-    
+
+    const tables = ['metrics_history'];
+    const oldTable = await db.prepare(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name='metrics_history_old'`
+    ).first();
+    if (oldTable) tables.push('metrics_history_old');
+
     let added = 0;
-    for (const [colName, colDef] of Object.entries(newHistoryCols)) {
-      if (!existingHistoryCols.includes(colName)) {
-        await db.prepare(`ALTER TABLE metrics_history ADD COLUMN ${colName} ${colDef}`).run();
-        added++;
+    for (const tableName of tables) {
+      const { results: historyColumns } = await db.prepare(`PRAGMA table_info(${tableName})`).all();
+      const existingHistoryCols = historyColumns.map(c => c.name);
+
+      for (const [colName, colDef] of Object.entries(newHistoryCols)) {
+        if (!existingHistoryCols.includes(colName)) {
+          await db.prepare(`ALTER TABLE ${tableName} ADD COLUMN ${colName} ${colDef}`).run();
+          added++;
+        }
       }
     }
-    
+
     return { success: true, added };
   } catch (e) {
-    console.error('添加 metrics_history 表列失败:', e);
+    debug('Failed to add metrics_history columns:', e);
     return { success: false, error: e.message };
   }
 }
 
 async function dropMetricsAggregatedTable(db) {
-  console.log('开始删除弃用的 metrics_aggregated 表...');
+  debug('开始删除弃用的 metrics_aggregated 表...');
   try {
     const { results: tables } = await db.prepare(
       `SELECT name FROM sqlite_master WHERE type='table' AND name='metrics_aggregated'`
@@ -204,16 +264,16 @@ async function dropMetricsAggregatedTable(db) {
     }
     
     await db.prepare(`DROP TABLE metrics_aggregated`).run();
-    console.log('✅ 已删除 metrics_aggregated 表');
+    debug('✅ 已删除 metrics_aggregated 表');
     return { success: true, dropped: 1, message: '已删除 metrics_aggregated 表' };
   } catch (e) {
-    console.error('删除 metrics_aggregated 表失败:', e);
+    debug('删除 metrics_aggregated 表失败:', e);
     return { success: false, error: e.message };
   }
 }
 
 export async function cleanupStaleSettings(db) {
-  console.log('开始清理废弃的 settings key...');
+  debug('开始清理废弃的 settings key...');
   try {
     const stalePrefixes = ['last_write_%'];
     const staleExact = [
@@ -230,10 +290,10 @@ export async function cleanupStaleSettings(db) {
       'custom_head',
       'custom_script',
       'custom_bg',
+      'favicon',
       'is_public',
       'show_price',
       'show_expire',
-      'show_bw',
       'show_tf',
       'show_time',
       'show_long_history',
@@ -250,11 +310,11 @@ export async function cleanupStaleSettings(db) {
       `DELETE FROM settings WHERE ${staleKeysWhere}`
     ).bind(...staleBindings).run();
     if (cleanupResult.changes > 0) {
-      console.log(`已清理 ${cleanupResult.changes} 个废弃的 settings key`);
+      debug(`已清理 ${cleanupResult.changes} 个废弃的 settings key`);
     }
     return { success: true, cleaned: cleanupResult.changes };
   } catch (e) {
-    console.error('清理废弃 settings key 失败:', e);
+    debug('清理废弃 settings key 失败:', e);
     return { success: false, error: e.message };
   }
 }

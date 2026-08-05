@@ -16,15 +16,9 @@ export const CHART = {
   MAX_TICKS_HOUR: 12
 }
 
-// 历史图表的前端换行阈值。
-// 每个值均为该范围对应的后端采样间隔乘以该范围的容差倍数，以便各范围可独立调优。
-export const HISTORY_SAMPLE_INTERVAL = {
-  BELOW_12_HOURS: 5 * 60 * 1000 * 1.1,
-  FROM_12_HOURS: 10 * 60 * 1000 * 1.1,
-  FROM_24_HOURS: 15 * 60 * 1000 * 1.1,
-  FROM_48_HOURS: 40 * 60 * 1000 * 1.1,
-  FROM_96_HOURS: 60 * 60 * 1000 * 1.1,
-  OVER_168_HOURS: 80 * 60 * 1000 * 1.1
+export const HISTORY = {
+  LONG_RANGE_POINT_OPTIONS: [60, 120, 180, 240],
+  DEFAULT_LONG_RANGE_POINTS: 120
 }
 
 export const PING = {
@@ -57,7 +51,7 @@ export const COLORS = {
 export default {
   TIME,
   CHART,
-  HISTORY_SAMPLE_INTERVAL,
+  HISTORY,
   PING,
   STORAGE,
   STATUS,

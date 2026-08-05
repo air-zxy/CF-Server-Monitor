@@ -2,8 +2,144 @@ import { checkAuth, simpleAuthResponse } from '../middleware/auth.js';
 import { getLatestMetrics, getLatestMetricsForAllServers } from '../database/schema.js';
 import { getAllServers, getServerDetail } from '../utils/cache.js';
 import { mergeMetricsIntoServer } from '../utils/metrics.js';
-import { DEFAULT_SITE_TITLE } from '../utils/settings.js';
+import { normalizeLongHistoryPoints } from '../utils/settings.js';
 import { createSuccessResponse, createBadRequestResponse, createNotFoundResponse } from '../utils/errors.js';
+import {
+  cacheLatestReportUpdate,
+  getLatestReportSampleTimestamp,
+  getWorkerLatestReportUpdates
+} from '../utils/latestReportCache.js';
+
+const LATEST_REPORT_ID_CHUNK_SIZE = 500;
+
+function toPublicIpReachability(value) {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  return normalized && normalized !== '0' && normalized !== 'false' ? '1' : '0';
+}
+
+function normalizePublicIpFields(item, ensureFields = true) {
+  if (ensureFields || Object.prototype.hasOwnProperty.call(item, 'ip_v4')) {
+    item.ip_v4 = toPublicIpReachability(item.ip_v4);
+  }
+  if (ensureFields || Object.prototype.hasOwnProperty.call(item, 'ip_v6')) {
+    item.ip_v6 = toPublicIpReachability(item.ip_v6);
+  }
+  for (const field of ['data', 'payload', 'metrics']) {
+    if (item[field] && typeof item[field] === 'object' && !Array.isArray(item[field])) {
+      item[field] = normalizePublicIpFields({ ...item[field] }, false);
+    }
+  }
+  return item;
+}
+
+function withoutPrivateServerFields(server) {
+  const item = { ...server };
+  delete item.bandwidth;
+  delete item.note;
+  delete item.auto_update;
+  return normalizePublicIpFields(item);
+}
+
+function normalizeLatestReportSample(sample) {
+  if (!sample || typeof sample !== 'object') return null;
+  const data = sample?.data || sample?.payload || sample?.metrics;
+  if (!data || typeof data !== 'object') return null;
+
+  const publicData = normalizePublicIpFields({ ...data }, false);
+  const ts = sample.ts ?? sample.timestamp;
+  return ts === undefined ? { data: publicData } : { ts, data: publicData };
+}
+
+function normalizeLatestReportUpdate(update) {
+  if (!update || !Array.isArray(update.samples)) return null;
+
+  const samples = update.samples
+    .map(normalizeLatestReportSample)
+    .filter(Boolean);
+  if (samples.length === 0) return null;
+
+  return {
+    ...update,
+    samples
+  };
+}
+
+async function getDurableLatestReportUpdates(env, serverIds) {
+  if (!env.METRICS_BROADCASTER || !Array.isArray(serverIds) || serverIds.length === 0) return [];
+
+  try {
+    const id = env.METRICS_BROADCASTER.idFromName('global');
+    const stub = env.METRICS_BROADCASTER.get(id);
+    const updates = [];
+
+    for (let offset = 0; offset < serverIds.length; offset += LATEST_REPORT_ID_CHUNK_SIZE) {
+      const chunk = serverIds.slice(offset, offset + LATEST_REPORT_ID_CHUNK_SIZE);
+      const response = await stub.fetch('http://internal/latest-report-updates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ serverIds: chunk })
+      });
+      if (!response.ok) continue;
+      const data = await response.json();
+      if (Array.isArray(data?.updates)) updates.push(...data.updates);
+    }
+
+    return updates;
+  } catch (e) {
+    console.warn('[Dashboard] Failed to read latest report updates:', e?.message || e);
+    return [];
+  }
+}
+
+function mergeLatestReportUpdates(serverIds, durableUpdates, workerUpdates) {
+  const merged = new Map();
+
+  for (const update of durableUpdates) {
+    if (!update?.serverId || !Array.isArray(update.samples)) continue;
+    merged.set(String(update.serverId), update);
+  }
+
+  // Worker 缓存后合并：样本更新时取更新的一包；同一包优先使用更准确的 Worker 接收时间。
+  for (const update of workerUpdates) {
+    if (!update?.serverId || !Array.isArray(update.samples)) continue;
+    const serverId = String(update.serverId);
+    const existing = merged.get(serverId);
+    if (!existing || getLatestReportSampleTimestamp(update) >= getLatestReportSampleTimestamp(existing)) {
+      merged.set(serverId, update);
+    }
+  }
+
+  const now = Date.now();
+  return serverIds.map(serverId => merged.get(String(serverId)))
+    .filter(Boolean)
+    .map(update => normalizeLatestReportUpdate({
+      ...update,
+      reportAgeMs: Math.max(0, now - Number(update.reportTs || now))
+    }))
+    .filter(Boolean);
+}
+
+async function getLatestReportUpdatesForServers(env, serverIds) {
+  const normalizedServerIds = Array.from(new Set(
+    (Array.isArray(serverIds) ? serverIds : [])
+      .map(serverId => String(serverId || '').trim())
+      .filter(Boolean)
+  ));
+  if (normalizedServerIds.length === 0) return [];
+
+  const durableLatestReportUpdates = await getDurableLatestReportUpdates(env, normalizedServerIds);
+
+  // DO 命中后反向预热当前 Worker isolate，降低随后 DO 休眠造成的空缓存概率。
+  for (const update of durableLatestReportUpdates) {
+    cacheLatestReportUpdate(update.serverId, update.samples, update.reportTs);
+  }
+
+  return mergeLatestReportUpdates(
+    normalizedServerIds,
+    durableLatestReportUpdates,
+    getWorkerLatestReportUpdates(normalizedServerIds)
+  );
+}
 
 export async function handleServerAPI(request, env, sys) {
   const isLoggedIn = await checkAuth(request, env, sys);
@@ -20,13 +156,17 @@ export async function handleServerAPI(request, env, sys) {
   const server = await getServerDetail(env.DB, id, isLoggedIn);
   if (!server) return createNotFoundResponse('Server not found');
   
-  const latestMetrics = await getLatestMetrics(env.DB, id);
+  const [latestMetrics, latestReportUpdates] = await Promise.all([
+    getLatestMetrics(env.DB, id, server),
+    getLatestReportUpdatesForServers(env, [id])
+  ]);
   mergeMetricsIntoServer(server, latestMetrics);
+  server.latestReportUpdates = latestReportUpdates;
   server.sysConfig = {
-    show_long_history: sys.show_long_history === 'true'
+    long_history_points: Number(normalizeLongHistoryPoints(sys.long_history_points))
   };
   
-  return createSuccessResponse(server);
+  return createSuccessResponse(withoutPrivateServerFields(server));
 }
 
 export async function handleServersAPI(request, env, sys) {
@@ -36,9 +176,13 @@ export async function handleServersAPI(request, env, sys) {
     return simpleAuthResponse();
   }
   
-  const results = await getAllServers(env.DB, isLoggedIn);
+  const results = (await getAllServers(env.DB, isLoggedIn)).map(withoutPrivateServerFields);
   
-  const latestMetricsMap = await getLatestMetricsForAllServers(env.DB);
+  const serverIds = results.map(server => server.id).filter(Boolean);
+  const [latestMetricsMap, latestReportUpdates] = await Promise.all([
+    getLatestMetricsForAllServers(env.DB),
+    getLatestReportUpdatesForServers(env, serverIds)
+  ]);
   
   const now = Date.now();
   let globalOnline = 0;
@@ -54,6 +198,7 @@ export async function handleServersAPI(request, env, sys) {
       isOnline = (now - latestMetrics.timestamp) < 300000;
       mergeMetricsIntoServer(server, latestMetrics);
     }
+    normalizePublicIpFields(server);
     
     if (isOnline) {
       globalOnline++;
@@ -74,6 +219,7 @@ export async function handleServersAPI(request, env, sys) {
 
   const data = {
     servers: results,
+    latestReportUpdates,
     stats: {
       total: results.length,
       online: globalOnline,
@@ -87,13 +233,11 @@ export async function handleServersAPI(request, env, sys) {
     sysConfig: {
       show_price: sys.show_price === 'true',
       show_expire: sys.show_expire === 'true',
-      show_bw: sys.show_bw === 'true',
       show_tf: sys.show_tf === 'true',
       show_time: sys.show_time === 'true',
-      site_title: sys.site_title || DEFAULT_SITE_TITLE
+      display_mode: sys.display_mode || 'bar'
     }
   };
 
   return createSuccessResponse(data);
 }
-

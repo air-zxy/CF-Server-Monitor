@@ -1,12 +1,44 @@
 import { checkAuth, simpleAuthResponse, validateCredentials, generateToken } from '../middleware/auth.js';
 import { getLatestMetricsForAllServers } from '../database/schema.js';
-import { getAllServers, clearServersListCache, clearServerDetailCache } from '../utils/cache.js';
-import { clearSiteSettingsCache, saveSiteOptions } from '../utils/settings.js';
+import { getAllServers, clearServersListCache } from '../utils/cache.js';
+import { clearAppearanceSettingsCache, normalizeDisplayMode, normalizeExpireReminder, normalizeLongHistoryPoints, normalizeResourceAlertRules, normalizeTgNotify, saveSiteOptions, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
 import { mergeMetricsIntoServer } from '../utils/metrics.js';
 import { verifyTurnstileToken, hashPassword } from '../utils/common.js';
 import { AppError, createSuccessResponse, createBadRequestResponse, createUnauthorizedResponse, createErrorResponse } from '../utils/errors.js';
 import { addServerColumns } from '../database/updateDatabase.js';
-import { sendNotification } from '../services/notification.js';
+import { clearResourceAlertState, sendNotification } from '../services/notification.js';
+import { getNextServerHistoryPartitionId, HISTORY_MAX_PARTITION_ID } from '../database/indexOptimization.js';
+import { isValidTrafficCorrection, validateAgentConfigInput, validatePingNode, validateNetworkInterfaces } from '../utils/agentConfig.js';
+import { detectBillingCycle, detectCurrencySymbol, normalizeBillingCycle, normalizeCurrency, normalizePrice, renewExpireDateIfNeeded } from '../utils/serverBilling.js';
+
+const PING_NODE_FIELDS = ['custom_ct', 'custom_cu', 'custom_cm', 'custom_bd'];
+const THEME_PREVIEW_AUTH_COOKIE = 'cfsm_theme_preview_auth';
+const THEME_PREVIEW_AUTH_TTL = 600;
+
+function normalizeBooleanFlag(value) {
+  return value === true || value === 1 || value === '1' || value === 'true' ? '1' : '0';
+}
+
+function normalizeServerRegion(value) {
+  return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 16);
+}
+
+function normalizeServerBillingData(data = {}) {
+  const billingCycle = normalizeBillingCycle(data.billing_cycle || detectBillingCycle(data.price));
+  const autoRenewal = normalizeBooleanFlag(data.auto_renewal);
+
+  return {
+    price: normalizePrice(data.price),
+    billing_cycle: billingCycle,
+    auto_renewal: autoRenewal,
+    currency: normalizeCurrency(data.currency || detectCurrencySymbol(data.price) || '¥'),
+    expire_date: renewExpireDateIfNeeded(
+      data.expire_date || '',
+      billingCycle,
+      autoRenewal
+    ).expire_date
+  };
+}
 
 function isValidUUID(id) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
@@ -16,48 +48,177 @@ function isValidName(name) {
   return name && typeof name === 'string' && name.trim().length > 0 && name.length <= 100;
 }
 
+function isMissingColumnError(error) {
+  const message = error?.message || String(error);
+  return /no such column|has no column/i.test(message);
+}
+
+async function handleServerMutationError(db, error, fallbackMessage) {
+  if (isMissingColumnError(error)) {
+    console.warn('检测到数据库字段缺失，尝试添加缺失字段...');
+    await addServerColumns(db);
+    return createBadRequestResponse('dbColumnsAdded');
+  }
+
+  const errMsg = error?.message || String(error);
+  return createBadRequestResponse(errMsg || fallbackMessage);
+}
+
+function sanitizeCspDomains(input) {
+  if (!input || typeof input !== 'string') return '';
+  return input
+    .split(',')
+    .map(s => s.trim())
+    .map(normalizeCspOrigin)
+    .filter(Boolean)
+    .filter((domain, index, arr) => arr.indexOf(domain) === index)
+    .join(',');
+}
+
+function normalizeCspOrigin(value) {
+  const raw = String(value || '').trim();
+  if (!raw || /[\s;"']/.test(raw)) return '';
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== 'https:') return '';
+    if (url.username || url.password || url.search || url.hash) return '';
+    if (url.pathname && url.pathname !== '/') return '';
+    return url.origin;
+  } catch (_) {
+    return '';
+  }
+}
+
+function normalizePingNodeFields(source, fields = PING_NODE_FIELDS) {
+  const values = {};
+  for (const field of fields) {
+    if (source?.[field] === undefined) continue;
+    const result = validatePingNode(source?.[field]);
+    if (!result.valid) {
+      return { valid: false, field };
+    }
+    values[field] = result.value;
+  }
+  return { valid: true, values };
+}
+
+function normalizeNetworkInterfaceField(value) {
+  const result = validateNetworkInterfaces(value);
+  if (!result.valid) {
+    return { valid: false, value: '' };
+  }
+  return { valid: true, value: result.value };
+}
+
+function hasAppearanceInput(settings) {
+  if (settings.appearance_options !== undefined) return true;
+  return APPEARANCE_FIELDS
+    .filter(field => field !== 'theme_options')
+    .some(field => settings[field] !== undefined);
+}
+
+function extractBearerToken(request) {
+  const authHeader = request.headers.get('Authorization') || '';
+  const parts = authHeader.trim().split(/\s+/);
+  return parts[0] === 'Bearer' && parts[1] ? parts[1] : '';
+}
+
+function buildThemePreviewUrl(request, themeUrl) {
+  const previewUrl = new URL('/', request.url);
+  previewUrl.searchParams.set('theme_url', themeUrl);
+  return previewUrl.toString();
+}
+
+function buildThemePreviewAuthCookie(request, token) {
+  const secure = new URL(request.url).protocol === 'https:' ? '; Secure' : '';
+  return `${THEME_PREVIEW_AUTH_COOKIE}=${encodeURIComponent(token)}; Max-Age=${THEME_PREVIEW_AUTH_TTL}; Path=/; HttpOnly; SameSite=Lax${secure}`;
+}
+
+function buildClearThemePreviewAuthCookie(request) {
+  const secure = new URL(request.url).protocol === 'https:' ? '; Secure' : '';
+  return `${THEME_PREVIEW_AUTH_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax${secure}`;
+}
+
+function normalizeThemeUrl(value) {
+  if (value === undefined) return undefined;
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== 'https:') return null;
+    if (url.hostname !== 'github.com') return null;
+    if (url.username || url.password || url.search || url.hash) return null;
+
+    const parts = url.pathname.split('/').filter(Boolean);
+    const ref = parts[3];
+    if (
+      parts.length < 4 ||
+      parts[2] !== 'tree' ||
+      !/^[A-Za-z0-9._-]+$/.test(parts[0]) ||
+      !/^[A-Za-z0-9._-]+$/.test(parts[1]) ||
+      !/^[A-Za-z0-9._-]+$/.test(ref) ||
+      parts.some(part => part === '.' || part === '..' || /[%\\]/.test(part))
+    ) {
+      return null;
+    }
+
+    return `https://github.com/${parts.join('/')}`;
+  } catch (_) {
+    return null;
+  }
+}
+
+function getThemeRawIndexUrl(themeUrl) {
+  const normalized = normalizeThemeUrl(themeUrl);
+  if (!normalized) return '';
+
+  const url = new URL(normalized);
+  const parts = url.pathname.split('/').filter(Boolean);
+  const owner = parts[0];
+  const repo = parts[1];
+  const ref = parts[3];
+  const themePath = [owner, repo, ref, ...parts.slice(4)]
+    .map(part => encodeURIComponent(part))
+    .join('/');
+  return `https://raw.githubusercontent.com/${themePath}/index.html`;
+}
+
+async function validateThemeUrlAvailable(themeUrl) {
+  if (!themeUrl) return true;
+
+  const rawIndexUrl = getThemeRawIndexUrl(themeUrl);
+  if (!rawIndexUrl) return false;
+
+  try {
+    const res = await fetch(rawIndexUrl, {
+      method: 'GET',
+      headers: { 'User-Agent': 'CFSM-Theme-Validate' }
+    });
+    return res.ok;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function deleteServer(db, id) {
-  // 1. 先删 servers（fast path）
   try {
-    await db.prepare('DELETE FROM servers WHERE id = ?').bind(id).run();
-    console.log('✅ servers 删除成功');
-    return { success: true, step: 1 };
-  } catch (err) {
-    // 只有 FOREIGN KEY 才进入 fallback
-    if (!err.message?.includes('FOREIGN KEY constraint failed')) {
-      throw err;
+    const stmt1 = db.prepare(`PRAGMA foreign_key_list(metrics_history)`);
+    const result1 = await stmt1.all();
+    if (result1.results.length > 0) {
+      await db.prepare('DELETE FROM metrics_history WHERE server_id = ?').bind(id).run();
     }
-  }
 
-  // 3. 删除 old 表（可能不存在）
-  await db.prepare('DELETE FROM metrics_history_old WHERE server_id = ?').bind(id).run();
-
-  // 4. 再试一次删除 servers
-  try {
-    await db.prepare('DELETE FROM servers WHERE id = ?').bind(id).run();
-    console.log('✅ servers 删除成功（after old cleanup）');
-    return { success: true, step: 4 };
-  } catch (err) {
-    if (!err.message?.includes('FOREIGN KEY constraint failed')) {
-      throw err;
+    const stmt2 = db.prepare(`PRAGMA foreign_key_list(metrics_history_old)`);
+    const result2 = await stmt2.all();
+    if (result2.results.length > 0) {
+      await db.prepare('DELETE FROM metrics_history_old WHERE server_id = ?').bind(id).run();
     }
-  }
 
-  // 5. 删除新表
-  await db.prepare('DELETE FROM metrics_history WHERE server_id = ?').bind(id).run();
-
-  // 6. 最终兜底删除
-  try {
     await db.prepare('DELETE FROM servers WHERE id = ?').bind(id).run();
   } catch (err) {
     throw err;
   }
-}
-
-function normalizeInterval(value, fallback, min = 1, max = 86400) {
-  const num = parseInt(value, 10);
-  if (!Number.isFinite(num)) return fallback;
-  return Math.max(min, Math.min(max, num));
 }
 
 function getUtcTodayRange() {
@@ -73,12 +234,15 @@ function getUtcTodayRange() {
   };
 }
 
-function getLast24HoursRange() {
+function getUtcYesterdayRange() {
   const now = new Date();
-  const end = now;
-  const start = new Date(now.getTime() - 86400000);
+  const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const start = new Date(todayStart.getTime() - 86400000);
+  const end = new Date(todayStart.getTime() - 1);
   return {
-    date: start.toISOString().slice(0, 10) + ' ~ ' + end.toISOString().slice(0, 10),
+    date: start.toISOString().slice(0, 10),
+    start: start.toISOString().slice(0, 10),
+    end: end.toISOString().slice(0, 10),
     startTime: start.toISOString(),
     endTime: end.toISOString()
   };
@@ -102,7 +266,7 @@ async function cloudflareGraphql(query, variables, token) {
 }
 
 async function fetchCloudflareUsage(token, accountId, range) {
-  const query = `query CloudflareUsage($accountTag: string!, $start: Date, $end: Date, $startTime: string, $endTime: string) {
+  const query = `query CloudflareUsage($accountTag: string!, $start: Date, $end: Date, $startTime: Time!, $endTime: Time!) {
     viewer {
       accounts(filter: { accountTag: $accountTag }) {
         d1AnalyticsAdaptiveGroups(
@@ -123,8 +287,8 @@ async function fetchCloudflareUsage(token, accountId, range) {
   }`;
   const data = await cloudflareGraphql(query, {
     accountTag: accountId,
-    start: range.start || range.startTime.slice(0, 10),
-    end: range.end || range.endTime.slice(0, 10),
+    start: range.start,
+    end: range.end,
     startTime: range.startTime,
     endTime: range.endTime
   }, token);
@@ -146,12 +310,18 @@ async function getD1DailyUsage(token, accountId) {
   if (!accountId) throw new Error('cloudflareAccountIdRequired');
 
   const todayRange = getUtcTodayRange();
-  const last24Range = getLast24HoursRange();
+  const yesterdayRange = getUtcYesterdayRange();
 
-  const [todayUsage, last24Usage] = await Promise.all([
+  const [todayUsage, yesterdayUsage] = await Promise.all([
     fetchCloudflareUsage(token, accountId, todayRange),
-    fetchCloudflareUsage(token, accountId, last24Range)
+    fetchCloudflareUsage(token, accountId, yesterdayRange)
   ]);
+
+  const yesterday = {
+    rowsRead: yesterdayUsage.rowsRead,
+    rowsWritten: yesterdayUsage.rowsWritten,
+    workersRequests: yesterdayUsage.workersRequests
+  };
 
   return {
     today: {
@@ -159,15 +329,11 @@ async function getD1DailyUsage(token, accountId) {
       rowsWritten: todayUsage.rowsWritten,
       workersRequests: todayUsage.workersRequests
     },
-    last24Hours: {
-      rowsRead: last24Usage.rowsRead,
-      rowsWritten: last24Usage.rowsWritten,
-      workersRequests: last24Usage.workersRequests
-    }
+    yesterday
   };
 }
 
-export async function handleAdminAPI(request, env, sys) {
+export async function handleAdminAPI(request, env, sys, loadFullSettings = null) {
   try {
     const data = await request.json();
 
@@ -175,7 +341,7 @@ export async function handleAdminAPI(request, env, sys) {
       const { username, password } = data;
       
       if (!username || !password) {
-        return createBadRequestResponse('Missing username or password');
+        return createBadRequestResponse('missingCredentials');
       }
 
       const turnstileEnabled = sys && (sys.turnstile_enabled === 'true' || sys.turnstile_enabled === true);
@@ -187,7 +353,7 @@ export async function handleAdminAPI(request, env, sys) {
         const isTurnstileVerified = await verifyTurnstileToken(turnstileToken, turnstileSecretKey);
         
         if (!isTurnstileVerified) {
-          return createErrorResponse(new AppError('Turnstile verification failed', 403));
+          return createErrorResponse(new AppError('verificationFailed', 403));
         }
       }
 
@@ -201,7 +367,7 @@ export async function handleAdminAPI(request, env, sys) {
       const credentialResult = await validateCredentials(mockRequest, env, sys);
       
       if (!credentialResult.valid) {
-        return createUnauthorizedResponse('Invalid username or password');
+        return createUnauthorizedResponse('invalidCredentials');
       }
 
       if (credentialResult.needsPasswordUpgrade) {
@@ -218,8 +384,8 @@ export async function handleAdminAPI(request, env, sys) {
 
       try {
         const token = await generateToken(env, sys);
-        return createSuccessResponse({ 
-          success: true, 
+        return createSuccessResponse({
+          success: true,
           token: token,
           message: 'loginSuccessful'
         });
@@ -228,16 +394,46 @@ export async function handleAdminAPI(request, env, sys) {
       }
     }
 
+    if (data.action === 'clear_theme_preview_auth') {
+      return createSuccessResponse({
+        success: true
+      }, {
+        'Set-Cookie': buildClearThemePreviewAuthCookie(request)
+      });
+    }
+
     if (!await checkAuth(request, env, sys)) {
       return simpleAuthResponse();
     }
 
     if (data.action === 'get_settings') {
-      const { jwt_secret, ...safeSettings } = sys || {};
+      const fullSettings = loadFullSettings ? await loadFullSettings() : sys;
+      const { jwt_secret, ...safeSettings } = fullSettings || {};
       return createSuccessResponse({
         success: true,
         settings: safeSettings,
         api_secret: env.API_SECRET
+      });
+    }
+    else if (data.action === 'start_theme_preview') {
+      const normalizedThemeUrl = normalizeThemeUrl(data.theme_url);
+      if (!normalizedThemeUrl) {
+        return createBadRequestResponse('invalidThemeUrl');
+      }
+      if (!await validateThemeUrlAvailable(normalizedThemeUrl)) {
+        return createBadRequestResponse('invalidThemeUrl');
+      }
+
+      const token = extractBearerToken(request);
+      if (!token) {
+        return simpleAuthResponse();
+      }
+
+      return createSuccessResponse({
+        success: true,
+        preview_url: buildThemePreviewUrl(request, normalizedThemeUrl)
+      }, {
+        'Set-Cookie': buildThemePreviewAuthCookie(request, token)
       });
     }
     else if (data.action === 'list') {
@@ -251,18 +447,14 @@ export async function handleAdminAPI(request, env, sys) {
         online: 0,
         offline: 0,
         total_cpu: 0,
-        total_ram: 0,
-        total_disk: 0,
         total_net_in: 0,
         total_net_out: 0,
-        avg_cpu: 0,
-        avg_ram: 0,
-        avg_disk: 0
+        avg_cpu: 0
       };
       
       const serversWithStatus = servers.map(server => {
         const latestMetrics = latestMetricsMap.get(server.id);
-        const item = { ...server };
+        const item = { ...server, region_override: server.region || '' };
         let isOnline = false;
         
         if (latestMetrics) {
@@ -275,6 +467,7 @@ export async function handleAdminAPI(request, env, sys) {
           item.cpu_info = '';
           item.arch = '';
           item.os = '';
+          item.agent_version = '';
           item.ip_v4 = '0';
           item.ip_v6 = '0';
           item.boot_time = '';
@@ -282,12 +475,11 @@ export async function handleAdminAPI(request, env, sys) {
         
         item.is_online = isOnline;
         if (!item.region) item.region = server.region || '';
+        delete item.bandwidth;
 
         if (isOnline) {
           stats.online++;
           stats.total_cpu += parseFloat(item.cpu) || 0;
-          stats.total_ram += parseFloat(item.ram) || 0;
-          stats.total_disk += parseFloat(item.disk) || 0;
           stats.total_net_in += parseFloat(item.net_in_speed) || 0;
           stats.total_net_out += parseFloat(item.net_out_speed) || 0;
         } else {
@@ -299,8 +491,6 @@ export async function handleAdminAPI(request, env, sys) {
       
       if (stats.online > 0) {
         stats.avg_cpu = (stats.total_cpu / stats.online).toFixed(2);
-        stats.avg_ram = (stats.total_ram / stats.online).toFixed(2);
-        stats.avg_disk = (stats.total_disk / stats.online).toFixed(2);
       }
 
       return createSuccessResponse({
@@ -310,11 +500,17 @@ export async function handleAdminAPI(request, env, sys) {
       });
     }
     else if (data.action === 'd1_usage') {
+      const hasCloudflareToken = Object.prototype.hasOwnProperty.call(data, 'cloudflare_token');
+      const hasCloudflareAccountId = Object.prototype.hasOwnProperty.call(data, 'cloudflare_account_id');
+      const cloudflareToken = hasCloudflareToken ? data.cloudflare_token : (sys?.cloudflare_token || '');
+      const cloudflareAccountId = hasCloudflareAccountId ? data.cloudflare_account_id : (sys?.cloudflare_account_id || '');
+
       try {
-        const usage = await getD1DailyUsage(sys.cloudflare_token || '', sys.cloudflare_account_id || '');
+        const usage = await getD1DailyUsage(String(cloudflareToken || '').trim(), String(cloudflareAccountId || '').trim());
         return createSuccessResponse({
           success: true,
-          usage
+          usage,
+          message: 'd1UsageQueried'
         });
       } catch (e) {
         return createBadRequestResponse(e.message);
@@ -329,7 +525,8 @@ export async function handleAdminAPI(request, env, sys) {
         const testMsg = `✅ **测试通知**\n\n这是一条来自 CF Server Monitor 的测试消息。\n\n**时间:** ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`;
         const result = await sendNotification({ tg_bot_token, tg_chat_id: tg_chat_id || '' }, testMsg);
         if(result) {
-          return createBadRequestResponse(result);
+          console.warn('Test notification failed:', result);
+          return createBadRequestResponse('testNotificationFailed');
         }
         return createSuccessResponse({ success: true, message: 'testNotificationSent' });
       } catch (e) {
@@ -338,36 +535,87 @@ export async function handleAdminAPI(request, env, sys) {
     }
     else if (data.action === 'save_settings') {
       const settings = data.settings || {};
+      const normalizedThemeUrl = normalizeThemeUrl(settings.theme_url);
+      if (normalizedThemeUrl === null) {
+        return createBadRequestResponse('invalidThemeUrl');
+      }
+      if (normalizedThemeUrl && !await validateThemeUrlAvailable(normalizedThemeUrl)) {
+        return createBadRequestResponse('invalidThemeUrl');
+      }
 
       // 如果 turnstile_enabled 或 turnstile_login_enabled 开启，验证 turnstile_site_key 和 turnstile_secret_key 都不为空
       if (settings.turnstile_enabled === 'true' || settings.turnstile_enabled === true || settings.turnstile_login_enabled === 'true' || settings.turnstile_login_enabled === true) {
         if (!settings.turnstile_site_key || settings.turnstile_site_key.trim().length === 0) {
-          return createBadRequestResponse('Turnstile Site Key is required when Turnstile is enabled');
+          return createBadRequestResponse('turnstileSiteKeyRequired');
         }
         if (!settings.turnstile_secret_key || settings.turnstile_secret_key.trim().length === 0) {
-          return createBadRequestResponse('Turnstile Secret Key is required when Turnstile is enabled');
+          return createBadRequestResponse('turnstileSecretKeyRequired');
         }
       }
 
       // 如果 tg_notify 或 expire_reminder 开启，验证 tg_bot_token 不为空
-      if (settings.tg_notify === 'true' || settings.expire_reminder === 'true') {
-        if (!settings.tg_bot_token || settings.tg_bot_token.trim().length === 0) {
-          return createBadRequestResponse('Telegram Bot Token is required when notifications are enabled');
+      const hasResourceAlertRulesInput = settings.resource_alert_rules !== undefined;
+      const tgNotify = settings.tg_notify !== undefined
+        ? normalizeTgNotify(settings.tg_notify)
+        : normalizeTgNotify(sys?.tg_notify);
+      const expireReminder = settings.expire_reminder !== undefined
+        ? normalizeExpireReminder(settings.expire_reminder)
+        : normalizeExpireReminder(sys?.expire_reminder);
+      const currentResourceAlertRules = normalizeResourceAlertRules(sys?.resource_alert_rules);
+      const normalizedResourceAlertRules = hasResourceAlertRulesInput
+        ? normalizeResourceAlertRules(settings.resource_alert_rules)
+        : currentResourceAlertRules;
+      const resourceAlertEnabled = normalizedResourceAlertRules.length > 0;
+      if (tgNotify !== '0' || expireReminder !== '0' || resourceAlertEnabled) {
+        const effectiveTgBotToken = settings.tg_bot_token !== undefined
+          ? settings.tg_bot_token
+          : sys?.tg_bot_token;
+        if (!effectiveTgBotToken || String(effectiveTgBotToken).trim().length === 0) {
+          return createBadRequestResponse('tgBotTokenRequired');
         }
       }
 
-      const APPEARANCE_FIELDS = ['site_title', 'custom_bg', 'custom_head', 'custom_script'];
-      const SITE_FIELDS = ['is_public', 'show_price', 'show_expire', 'show_bw', 'show_tf', 'show_time', 'show_long_history', 'tg_notify', 'tg_bot_token', 'tg_chat_id', 'turnstile_enabled', 'turnstile_login_enabled', 'turnstile_site_key', 'turnstile_secret_key', 'jwt_secret', 'username', 'password', 'cloudflare_account_id', 'cloudflare_token', 'custom_ct', 'custom_cu', 'custom_cm', 'custom_bd', 'cleanup_skip_count', 'expire_reminder'];
+      const pingNodes = normalizePingNodeFields(settings);
+      if (!pingNodes.valid) {
+        return createBadRequestResponse('invalidPingNodeFormat');
+      }
 
+      if (settings.appearance_options !== undefined && (
+        settings.appearance_options === null ||
+        typeof settings.appearance_options !== 'object' ||
+        Array.isArray(settings.appearance_options)
+      )) {
+        return createBadRequestResponse('invalidThemeOptionsFormat');
+      }
+
+      const shouldSaveAppearanceOptions = hasAppearanceInput(settings);
       const appearanceOptions = {};
-      for (const field of APPEARANCE_FIELDS) {
-        if (settings[field] !== undefined) {
-          appearanceOptions[field] = settings[field];
+
+      if (shouldSaveAppearanceOptions) {
+        const nestedAppearanceOptions = settings.appearance_options || {};
+        for (const field of APPEARANCE_FIELDS) {
+          const value = field === 'theme_options' ? nestedAppearanceOptions.theme_options : settings[field];
+          if (value !== undefined) {
+            // CSP 字段格式校验：只允许 https:// 开头的域名，逗号分隔
+            if (field === 'csp_static' || field === 'csp_api') {
+              appearanceOptions[field] = sanitizeCspDomains(value);
+            } else if (field === 'display_mode') {
+              appearanceOptions[field] = normalizeDisplayMode(value);
+            } else if (field === 'theme_options') {
+              if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+                return createBadRequestResponse('invalidThemeOptionsFormat');
+              }
+              appearanceOptions[field] = value;
+            } else {
+              appearanceOptions[field] = value;
+            }
+          }
         }
+        await env.DB.prepare(
+          'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+        ).bind('appearance_options', JSON.stringify(appearanceOptions)).run();
+        clearAppearanceSettingsCache();
       }
-      await env.DB.prepare(
-        'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
-      ).bind('appearance_options', JSON.stringify(appearanceOptions)).run();
 
       const siteOptions = {};
       for (const field of SITE_FIELDS) {
@@ -376,13 +624,30 @@ export async function handleAdminAPI(request, env, sys) {
             if (settings[field] && settings[field].length > 0) {
               siteOptions[field] = await hashPassword(settings[field]);
             }
+          } else if (PING_NODE_FIELDS.includes(field)) {
+            siteOptions[field] = pingNodes.values[field];
+          } else if (field === 'tg_notify') {
+            siteOptions[field] = tgNotify;
+          } else if (field === 'expire_reminder') {
+            siteOptions[field] = expireReminder;
+          } else if (field === 'long_history_points') {
+            siteOptions[field] = normalizeLongHistoryPoints(settings[field]);
+          } else if (field === 'resource_alert_rules') {
+            siteOptions[field] = normalizedResourceAlertRules;
+          } else if (field === 'theme_url') {
+            siteOptions[field] = normalizedThemeUrl;
           } else {
             siteOptions[field] = settings[field];
           }
         }
       }
       await saveSiteOptions(env.DB, siteOptions);
-      Object.assign(sys, appearanceOptions, siteOptions);
+      // Keep existing states on rule edits so threshold increases can emit recovery notifications.
+      // checkResourceAlerts prunes states for removed rules or servers on the next evaluation.
+      if (hasResourceAlertRulesInput && !resourceAlertEnabled) {
+        await clearResourceAlertState(env.DB);
+      }
+      Object.assign(sys, shouldSaveAppearanceOptions ? appearanceOptions : {}, siteOptions);
       return createSuccessResponse({
         success: true,
         message: 'updateSuccess'
@@ -393,18 +658,29 @@ export async function handleAdminAPI(request, env, sys) {
       if (!isValidName(name)) {
         return createBadRequestResponse('invalidServerName');
       }
+      const networkInterfaces = normalizeNetworkInterfaceField(data.interface);
+      if (!networkInterfaces.valid) {
+        return createBadRequestResponse('invalidNetworkInterface');
+      }
       
       const id = crypto.randomUUID();
       const group = data.server_group || 'Default';
-      
-      const { max_order } = await env.DB.prepare('SELECT COALESCE(MAX(sort_order), -1) as max_order FROM servers').first();
-      const sortOrder = (max_order || 0) + 1;
-      
-      await env.DB.prepare(`
-        INSERT INTO servers 
-        (id, name, server_group, sort_order) 
-        VALUES (?, ?, ?, ?)
-      `).bind(id, name, group, sortOrder).run();
+      const region = normalizeServerRegion(data.region);
+
+      try {
+        const { max_order } = await env.DB.prepare('SELECT COALESCE(MAX(sort_order), -1) as max_order FROM servers').first();
+        const sortOrder = (max_order || 0) + 1;
+
+        const historyPartitionId = await getNextServerHistoryPartitionId(env.DB);
+
+        await env.DB.prepare(`
+          INSERT INTO servers
+          (id, name, server_group, region, "interface", sort_order, history_partition_id, timestamp)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(id, name, group, region, networkInterfaces.value, sortOrder, historyPartitionId, Date.now()).run();
+      } catch (e) {
+        return handleServerMutationError(env.DB, e, 'serverAddFailed');
+      }
       
       clearServersListCache();
       
@@ -423,7 +699,6 @@ export async function handleAdminAPI(request, env, sys) {
       await deleteServer(env.DB, id);
       
       clearServersListCache();
-      clearServerDetailCache(id);
       
       return createSuccessResponse({ 
         success: true, 
@@ -451,46 +726,92 @@ export async function handleAdminAPI(request, env, sys) {
       });
     }
     else if (data.action === 'edit') {
-      const { id, name, server_group, price, expire_date, bandwidth, traffic_limit, traffic_calc_type, reset_day, collect_interval, report_interval, ping_mode, is_hidden } = data;
+      const { id, name, server_group, region, tags, note, price, billing_cycle, auto_renewal, currency, expire_date, traffic_limit, traffic_calc_type, interface: networkInterfaceInput, reset_day, collect_interval, report_interval, auto_update, custom_ct, custom_cu, custom_cm, custom_bd, rx_correction, tx_correction, offline_notify_disabled, is_hidden } = data;
       if (!id || !isValidUUID(id)) {
         return createBadRequestResponse('invalidServerId');
       }
-      const normalizedCollectInterval = normalizeInterval(collect_interval, 0, 0);
-      const normalizedReportInterval = Math.max(normalizedCollectInterval, normalizeInterval(report_interval, 60));
+      const agentConfigResult = validateAgentConfigInput({
+        collect_interval,
+        report_interval,
+        reset_day
+      });
+      if (!agentConfigResult.valid) {
+        return createBadRequestResponse(agentConfigResult.error);
+      }
+      const normalizedAgentConfig = agentConfigResult.config;
+
+      const pingNodes = normalizePingNodeFields({ custom_ct, custom_cu, custom_cm, custom_bd });
+      if (!pingNodes.valid) {
+        return createBadRequestResponse('invalidPingNodeFormat');
+      }
+      const networkInterfaces = normalizeNetworkInterfaceField(networkInterfaceInput);
+      if (!networkInterfaces.valid) {
+        return createBadRequestResponse('invalidNetworkInterface');
+      }
+      const safeTags = String(tags || '')
+        .split(',')
+        .map(tag => tag.trim().replace(/[^\p{L}\p{N} ._\-]/gu, '').slice(0, 32))
+        .filter(Boolean)
+        .slice(0, 12)
+        .join(',');
+      const safeNote = String(note || '').trim().slice(0, 500);
+
+      const toNullCorrection = (v) => {
+        if (v === null || v === undefined || v === '') return null;
+        return isValidTrafficCorrection(v) ? Number(v) : undefined;
+      };
+      const safeRx = toNullCorrection(rx_correction);
+      const safeTx = toNullCorrection(tx_correction);
+      if (safeRx === undefined || safeTx === undefined) {
+        return createBadRequestResponse('invalidTrafficCorrection');
+      }
+
+      const billingData = normalizeServerBillingData({
+        price,
+        billing_cycle,
+        auto_renewal,
+        currency,
+        expire_date
+      });
       
       try {
         await env.DB.prepare(`
           UPDATE servers
-          SET name = ?, server_group = ?, price = ?, expire_date = ?, bandwidth = ?, traffic_limit = ?, traffic_calc_type = ?, reset_day = ?, collect_interval = ?, report_interval = ?, ping_mode = ?, is_hidden = ?
+          SET name = ?, server_group = ?, region = ?, tags = ?, note = ?, price = ?, billing_cycle = ?, auto_renewal = ?, currency = ?, expire_date = ?, traffic_limit = ?, traffic_calc_type = ?, "interface" = ?, reset_day = ?, collect_interval = ?, report_interval = ?, auto_update = ?, custom_ct = ?, custom_cu = ?, custom_cm = ?, custom_bd = ?, rx_correction = ?, tx_correction = ?, offline_notify_disabled = ?, is_hidden = ?
           WHERE id = ?
         `).bind(
           name || '',
           server_group || 'Default',
-          price || '',
-          expire_date || '',
-          bandwidth || '',
+          normalizeServerRegion(region),
+          safeTags,
+          safeNote,
+          billingData.price,
+          billingData.billing_cycle,
+          billingData.auto_renewal,
+          billingData.currency,
+          billingData.expire_date,
           traffic_limit || '',
           traffic_calc_type || 'total',
-          reset_day !== undefined && reset_day !== null && reset_day !== '' ? reset_day : 1,
-          normalizedCollectInterval,
-          normalizedReportInterval,
-          ping_mode || 'http',
-          is_hidden || '0',
+          networkInterfaces.value,
+          normalizedAgentConfig.reset_day,
+          normalizedAgentConfig.collect_interval,
+          normalizedAgentConfig.report_interval,
+          normalizeBooleanFlag(auto_update),
+          pingNodes.values.custom_ct,
+          pingNodes.values.custom_cu,
+          pingNodes.values.custom_cm,
+          pingNodes.values.custom_bd,
+          safeRx,
+          safeTx,
+          normalizeBooleanFlag(offline_notify_disabled),
+          normalizeBooleanFlag(is_hidden),
           id
         ).run();
       } catch (e) {
-        if (e.message && /no such column/i.test(e.message)) {
-          console.warn('检测到数据库字段缺失，尝试添加缺失字段...');
-          await addServerColumns(env.DB);
-          return createBadRequestResponse('dbColumnsAdded');
-        }else{
-          const errMsg = e?.message || String(e);
-          return createBadRequestResponse(errMsg || 'serverUpdateFailed');
-        }
+        return handleServerMutationError(env.DB, e, 'serverUpdateFailed');
       }
       
       clearServersListCache();
-      clearServerDetailCache(id);
       
       return createSuccessResponse({ 
         success: true, 
@@ -514,13 +835,137 @@ export async function handleAdminAPI(request, env, sys) {
       }
       
       clearServersListCache();
-      for (const id of ids) {
-        clearServerDetailCache(id);
-      }
       
       return createSuccessResponse({ 
         success: true, 
         message: 'batchDeleted'
+      });
+    }
+    
+    else if (data.action === 'export_servers') {
+      try {
+        const servers = await env.DB.prepare('SELECT * FROM servers ORDER BY sort_order ASC').all();
+        return createSuccessResponse({
+          success: true,
+          servers: servers.results || [],
+          message: 'serversExported'
+        });
+      } catch (e) {
+        return createBadRequestResponse('serversExportFailed');
+      }
+    }
+    else if (data.action === 'import_servers') {
+      const { servers: importData } = data;
+      if (!importData || !Array.isArray(importData) || importData.length === 0) {
+        return createBadRequestResponse('noServersToImport');
+      }
+
+      const existingServers = await env.DB.prepare('SELECT id FROM servers').all();
+      const existingIds = new Set((existingServers.results || []).map(s => s.id));
+
+      const existingPartitionIds = await env.DB.prepare('SELECT history_partition_id FROM servers').all();
+      const usedPartitionIds = new Set(
+        (existingPartitionIds.results || []).map(s => s.history_partition_id).filter(id => id > 0)
+      );
+
+      let imported = 0;
+      let skipped = 0;
+      const skippedIds = [];
+
+      for (const server of importData) {
+        if (!server.id || !isValidUUID(server.id)) {
+          skipped++;
+          skippedIds.push(server.id || '(invalid)');
+          continue;
+        }
+
+        if (existingIds.has(server.id)) {
+          skipped++;
+          skippedIds.push(server.id);
+          continue;
+        }
+
+        let partitionId = Number(server.history_partition_id) || 0;
+        if (partitionId <= 0 || partitionId > HISTORY_MAX_PARTITION_ID || usedPartitionIds.has(partitionId)) {
+          partitionId = 0;
+          for (let id = 1; id <= HISTORY_MAX_PARTITION_ID; id++) {
+            if (!usedPartitionIds.has(id)) {
+              partitionId = id;
+              break;
+            }
+          }
+          if (partitionId === 0) {
+            skipped++;
+            skippedIds.push(server.id);
+            continue;
+          }
+        }
+
+        usedPartitionIds.add(partitionId);
+        existingIds.add(server.id);
+
+        const billingData = normalizeServerBillingData(server);
+        const networkInterfaces = normalizeNetworkInterfaceField(server.interface);
+        if (!networkInterfaces.valid) {
+          skipped++;
+          skippedIds.push(server.id);
+          continue;
+        }
+
+        try {
+          await env.DB.prepare(`
+            INSERT INTO servers (id, name, server_group, region, tags, note, price, billing_cycle, auto_renewal,
+              currency, expire_date,
+              traffic_limit, traffic_calc_type, "interface", reset_day, collect_interval, report_interval,
+              auto_update, custom_ct, custom_cu, custom_cm, custom_bd, rx_correction, tx_correction,
+              offline_notify_disabled, is_hidden, sort_order, history_partition_id, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            server.id,
+            server.name || '',
+            server.server_group || 'Default',
+            normalizeServerRegion(server.region),
+            server.tags || '',
+            server.note || '',
+            billingData.price,
+            billingData.billing_cycle,
+            billingData.auto_renewal,
+            billingData.currency,
+            billingData.expire_date,
+            server.traffic_limit || '',
+            server.traffic_calc_type || 'total',
+            networkInterfaces.value,
+            server.reset_day ?? 1,
+            server.collect_interval ?? 0,
+            server.report_interval ?? 60,
+            normalizeBooleanFlag(server.auto_update),
+            server.custom_ct || '',
+            server.custom_cu || '',
+            server.custom_cm || '',
+            server.custom_bd || '',
+            server.rx_correction ?? null,
+            server.tx_correction ?? null,
+            normalizeBooleanFlag(server.offline_notify_disabled),
+            normalizeBooleanFlag(server.is_hidden),
+            server.sort_order ?? 0,
+            partitionId,
+            server.timestamp || Date.now()
+          ).run();
+          imported++;
+        } catch (e) {
+          skipped++;
+          skippedIds.push(server.id);
+        }
+      }
+
+      clearServersListCache();
+
+      return createSuccessResponse({
+        success: true,
+        imported,
+        skipped,
+        skippedIds,
+        message: imported > 0 ? 'serversImported' : 'noServersImported'
       });
     }
     
